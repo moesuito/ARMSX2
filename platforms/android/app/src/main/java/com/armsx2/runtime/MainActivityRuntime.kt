@@ -2059,6 +2059,7 @@ open class MainActivityRuntime : ComponentActivity() {
             customDriverId.value = g0.customDriverId.takeIf { it.isNotBlank() }
         }
         surface.value = EmulationSurface(this)
+        DedicatedExternalDisplay.attach(this, surface.value!!)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
@@ -2288,9 +2289,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 androidx.compose.runtime.LaunchedEffect(
                     eState.value, currentGame.value?.settingsKey, surface.value
                 ) {
-                    val gameActive =
-                        eState.value == EmuState.RUNNING || eState.value == EmuState.PAUSED
-                    surface.value?.setGameActive(gameActive)
+                    DedicatedExternalDisplay.setGameState(eState.value)
                 }
                 WindowImpl.Window {
                     if (surface.value != null) {
@@ -4497,6 +4496,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun onPause() {
+        DedicatedExternalDisplay.setHostResumed(false)
         // DS-lid-style chime when the SCREEN is going off (device sleeping) — gated on isInteractive
         // so a plain background (home / recents, screen still on) stays silent. Fires before we pause
         // audio below so the blip is heard as the device sleeps.
@@ -4530,6 +4530,7 @@ open class MainActivityRuntime : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        DedicatedExternalDisplay.setHostResumed(true)
         // Woke from a real sleep (paired with the onPause sleep chime): play the wake chime + a brief
         // top-left "Welcome Back!". A plain background return never set wasAsleep, so this only fires
         // after an actual screen-off sleep.
@@ -4560,6 +4561,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        DedicatedExternalDisplay.detach(this)
         getSystemService(android.hardware.input.InputManager::class.java)
             ?.unregisterInputDeviceListener(inputDeviceListener)
         // On a CONFIGURATION-driven recreate (e.g. Samsung DeX moving the activity to
@@ -4575,6 +4577,11 @@ open class MainActivityRuntime : ComponentActivity() {
 
         val appPid = Process.myPid()
         Process.killProcess(appPid)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        DedicatedExternalDisplay.onHostConfigurationChanged()
     }
 
     private fun handleExternalLaunchIntent(intent: Intent?) {
