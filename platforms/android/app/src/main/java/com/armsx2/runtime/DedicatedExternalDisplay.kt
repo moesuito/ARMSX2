@@ -11,6 +11,7 @@ import android.view.Display
 import android.view.WindowManager
 import androidx.compose.runtime.mutableStateOf
 import com.armsx2.EmuState
+import kr.co.iefriends.pcsx2.NativeApp
 
 /**
  * Owns Android's secondary-display Presentation and hands the single renderer
@@ -137,13 +138,19 @@ object DedicatedExternalDisplay : DisplayManager.DisplayListener {
             return
         }
         primarySurface?.setRenderTargetActive(false)
-        owner.surface?.setRenderTargetActive(true)
-        active.value = true
+        if (owner.surface?.setRenderTargetActive(true) == true) {
+            active.value = true
+        } else {
+            restorePrimarySurface(owner.surface)
+        }
     }
 
-    private fun restorePrimarySurface() {
-        presentation?.surface?.setRenderTargetActive(false)
-        primarySurface?.setRenderTargetActive(true)
+    private fun restorePrimarySurface(
+        externalSurface: EmulationSurface? = presentation?.surface,
+    ) {
+        externalSurface?.setRenderTargetActive(false)
+        if (primarySurface?.setRenderTargetActive(true) != true)
+            NativeApp.onNativeSurfaceDestroyed()
         active.value = false
     }
 
@@ -153,9 +160,7 @@ object DedicatedExternalDisplay : DisplayManager.DisplayListener {
             return
         }
         presentation = null
-        old.surface?.setRenderTargetActive(false)
-        primarySurface?.setRenderTargetActive(true)
-        active.value = false
+        restorePrimarySurface(old.surface)
         runCatching { old.dismiss() }
     }
 

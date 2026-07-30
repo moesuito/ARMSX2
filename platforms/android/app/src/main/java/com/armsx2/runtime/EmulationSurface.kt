@@ -88,8 +88,8 @@ class EmulationSurface(
         onSurfaceAvailabilityChanged?.invoke(true)
     }
 
-    private fun publishSurface() {
-        if (!holder.surface.isValid || surfaceWidth <= 0 || surfaceHeight <= 0) return
+    private fun publishSurface(): Boolean {
+        if (!holder.surface.isValid || surfaceWidth <= 0 || surfaceHeight <= 0) return false
         reportActualDisplayRefreshRate()
         applyFrameRatePreference()
         if (!dedicatedOutput)
@@ -100,6 +100,7 @@ class EmulationSurface(
             surfaceHeight,
             dedicatedOutput,
         )
+        return true
     }
 
     /**
@@ -142,14 +143,18 @@ class EmulationSurface(
      * Hands the single native renderer between the phone and presentation surfaces.
      * Deactivating never destroys the native window: the new owner replaces it atomically.
      */
-    fun setRenderTargetActive(active: Boolean) {
-        if (renderTargetActive == active) return
+    fun setRenderTargetActive(active: Boolean): Boolean {
+        if (renderTargetActive == active) {
+            return !active ||
+                (holder.surface.isValid && surfaceWidth > 0 && surfaceHeight > 0)
+        }
         renderTargetActive = active
         if (active) {
-            publishSurface()
+            return publishSurface()
         } else {
             clearFrameRatePreference()
         }
+        return true
     }
 
     override fun onDisplayAdded(displayId: Int) = Unit
