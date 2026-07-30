@@ -39,6 +39,7 @@ import androidx.documentfile.provider.DocumentFile
 import com.armsx2.config.Settings
 import com.armsx2.i18n.I18n
 import com.armsx2.i18n.str
+import com.armsx2.runtime.DedicatedExternalDisplay
 import com.armsx2.runtime.MainActivityRuntime
 import com.armsx2.ui.Colors
 import com.armsx2.ui.InGameOverlay
@@ -103,6 +104,19 @@ fun RendererTab(state: MutableState<Settings>) {
             .fillMaxWidth(),
     ) {
         CollapsibleSection(str("renderer.section.displayResolution"), initiallyExpanded = true) {
+            ToggleRow(
+                str("renderer.dedicatedExternal.label"),
+                DedicatedExternalDisplay.enabled.value,
+                description = str(
+                    if (DedicatedExternalDisplay.blockedByDesktopMode.value)
+                        "renderer.dedicatedExternal.desktopIgnored"
+                    else
+                        "renderer.dedicatedExternal.description",
+                ),
+            ) {
+                DedicatedExternalDisplay.setEnabled(it)
+            }
+            SettingsDivider()
             // Graphics API (OpenGL / Vulkan) + Vulkan custom-driver picker.
             // from the removed first-run setup renderer page into settings.
             RendererBackendSection(state)

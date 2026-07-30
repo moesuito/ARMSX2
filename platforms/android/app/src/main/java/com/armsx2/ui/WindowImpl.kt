@@ -1,12 +1,18 @@
 package com.armsx2.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -19,9 +25,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.armsx2.EmuState
+import com.armsx2.i18n.str
+import com.armsx2.runtime.DedicatedExternalDisplay
 import com.armsx2.runtime.MainActivityRuntime
 import kotlinx.coroutines.flow.first
 
@@ -98,8 +108,12 @@ object WindowImpl {
                     LocalDensity provides baseDensity,
                     LocalLayoutDirection provides LayoutDirection.Ltr,
                 ) {
-                    com.armsx2.ui.touch.TouchControlsOverlay()
+                    if (!DedicatedExternalDisplay.active.value)
+                        com.armsx2.ui.touch.TouchControlsOverlay()
                 }
+
+            if (DedicatedExternalDisplay.active.value)
+                ExternalDisplayCompanion()
 
             if (showLibrary.value && MainActivityRuntime.eState.value == EmuState.RUNNING && !overlayVisible.value) {
                 Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.56f))) {
@@ -192,6 +206,44 @@ object WindowImpl {
                 // Transient top-left "Welcome Back!" banner (and any future brief note) — hosted
                 // here for the same reason as the keyboard: reachable above every surface.
                 com.armsx2.ui.WelcomeBannerOverlay(this)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExternalDisplayCompanion() {
+    Box(
+        modifier = Modifier.fillMaxSize().background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(
+                Modifier
+                    .size(width = 72.dp, height = 48.dp)
+                    .border(4.dp, Color.White, RoundedCornerShape(6.dp)),
+            )
+            Spacer(Modifier.height(20.dp))
+            Text(
+                str("externalDisplay.playing"),
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                str("externalDisplay.sending"),
+                color = Color.White.copy(alpha = 0.62f),
+                fontSize = 14.sp,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(28.dp))
+            Button(onClick = { InGameOverlay.open() }) {
+                Text(str("externalDisplay.pauseMenu"))
             }
         }
     }
