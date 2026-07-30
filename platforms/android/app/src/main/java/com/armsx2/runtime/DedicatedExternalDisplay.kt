@@ -47,6 +47,8 @@ object DedicatedExternalDisplay : DisplayManager.DisplayListener {
         displayManager = null
         primarySurface = null
         activity = null
+        gameActive = false
+        hostResumed = false
         blockedByDesktopMode.value = false
     }
 

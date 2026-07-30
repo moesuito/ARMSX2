@@ -62,7 +62,8 @@ class EmulationSurface(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        hostWindow()?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (!dedicatedOutput)
+            hostWindow()?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         displayManager.registerDisplayListener(this, null)
     }
 
@@ -70,7 +71,8 @@ class EmulationSurface(
         removeCallbacks(frameRateMonitor)
         clearFrameRatePreference()
         displayManager.unregisterDisplayListener(this)
-        hostWindow()?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (!dedicatedOutput)
+            hostWindow()?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onDetachedFromWindow()
     }
 
