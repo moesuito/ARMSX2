@@ -207,7 +207,9 @@ namespace Host
             }
             wi.surface_width = static_cast<u32>(std::max<CGFloat>(1.0, surfaceSize.width));
             wi.surface_height = static_cast<u32>(std::max<CGFloat>(1.0, surfaceSize.height));
-            wi.surface_scale = static_cast<float>(scale);
+            wi.surface_scale = dedicatedExternal ?
+                GSCalculateExternalDisplayOSDScale(wi.surface_width, wi.surface_height) :
+                static_cast<float>(scale);
 
             wi.surface_refresh_rate = screen.maximumFramesPerSecond > 0 ?
                 static_cast<float>(screen.maximumFramesPerSecond) : 60.0f;

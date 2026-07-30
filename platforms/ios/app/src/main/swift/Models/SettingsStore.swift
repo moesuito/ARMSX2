@@ -1417,6 +1417,16 @@ final class SettingsStore {
         _osdShowResolutionConfig.onSet?(osdShowResolution)
         markOsdCustom()
     }}
+    let _osdShowViewportConfig = Setting<Bool>(
+        section: "EmuCore/GS", key: "OsdShowViewport", default: false,
+        suppressible: false,
+        writer: ARMSX2Bridge.setINIBool)
+    var osdShowViewport: Bool = false { didSet {
+        guard !(_osdShowViewportConfig.suppressible && suppressINIWrites) else { return }
+        _osdShowViewportConfig.writer(_osdShowViewportConfig.section, _osdShowViewportConfig.key, osdShowViewport)
+        _osdShowViewportConfig.onSet?(osdShowViewport)
+        markOsdCustom()
+    }}
     let _osdShowGSStatsConfig = Setting<Bool>(
         section: "EmuCore/GS", key: "OsdShowGSStats", default: false,
         suppressible: false,
@@ -2055,6 +2065,7 @@ final class SettingsStore {
         osdShowCPU = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowCPU", defaultValue: false)
         osdShowGPU = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowGPU", defaultValue: false)
         osdShowResolution = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowResolution", defaultValue: false)
+        osdShowViewport = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowViewport", defaultValue: false)
         osdShowGSStats = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowGSStats", defaultValue: false)
         osdShowIndicators = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowIndicators", defaultValue: false)
         osdShowSettings = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowSettings", defaultValue: false)
@@ -2303,6 +2314,7 @@ final class SettingsStore {
         osdShowCPU = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowCPU", defaultValue: false)
         osdShowGPU = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowGPU", defaultValue: false)
         osdShowResolution = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowResolution", defaultValue: false)
+        osdShowViewport = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowViewport", defaultValue: false)
         osdShowGSStats = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowGSStats", defaultValue: false)
         osdShowIndicators = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowIndicators", defaultValue: false)
         osdShowSettings = ARMSX2Bridge.getINIBool("EmuCore/GS", key: "OsdShowSettings", defaultValue: false)
@@ -2537,6 +2549,7 @@ final class SettingsStore {
         osdShowCPU = isSimple || isDetail || isFull
         osdShowGPU = isDetail || isFull
         osdShowResolution = isDetail || isFull
+        osdShowViewport = isDetail || isFull
         osdShowGSStats = isFull
         osdShowIndicators = isDetail || isFull
         osdShowSettings = isFull
@@ -2562,6 +2575,7 @@ final class SettingsStore {
         (\.osdShowCPU, "OsdCustomShowCPU"),
         (\.osdShowGPU, "OsdCustomShowGPU"),
         (\.osdShowResolution, "OsdCustomShowResolution"),
+        (\.osdShowViewport, "OsdCustomShowViewport"),
         (\.osdShowGSStats, "OsdCustomShowGSStats"),
         (\.osdShowIndicators, "OsdCustomShowIndicators"),
         (\.osdShowSettings, "OsdCustomShowSettings"),

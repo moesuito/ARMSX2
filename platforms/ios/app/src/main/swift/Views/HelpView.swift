@@ -268,7 +268,9 @@ struct HelpView: View {
         let appName = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
             ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
             ?? "ARMSX2 iOS"
-        let appVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown"
+        let appVersion = bundle.object(forInfoDictionaryKey: "ARMSX2ReleaseVersion") as? String
+            ?? bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "Unknown"
         let buildNumber = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
         let device = UIDevice.current
 

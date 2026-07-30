@@ -56,15 +56,55 @@ iOS mirroring remains the fallback, but dedicated-output behavior should still
 be validated on each physical device, iOS version, HDMI adapter, and display
 combination before relying on it.
 
-The complete manual HDMI test suite passed on an iPhone 17 Pro Max with JIT
-enabled, including hot-plug, HDMI-only OSD, the OLED-black companion screen,
-virtual-input suppression, and pause/resume. The current iOS package reports
-version **2.6.7**; the Beta label remains because other device, adapter, display,
-and future iOS combinations have not been exhaustively covered.
+The complete 2.6.7 manual HDMI test suite passed on an iPhone 17 Pro Max with
+JIT enabled, including hot-plug, HDMI-only OSD, the OLED-black companion
+screen, virtual-input suppression, and pause/resume. The Beta label remains
+because other device, adapter, display, and future iOS combinations have not
+been exhaustively covered.
+
+### 2.6.7.1 HDMI OSD hotfix
+
+The 2.6.7.1 hotfix adds **Show Viewport** under **Settings > Overlay (OSD)**.
+When enabled, the performance overlay reports the active output surface and
+refresh rate in a compact form such as:
+
+```text
+Viewport: 1920x1080-60Hz
+```
+
+The value comes from the render window actually owned by Metal, so dedicated
+HDMI output reports the current external `UIScreenMode` pixel dimensions and
+the refresh rate exposed by iOS. It is independent of the existing internal
+game-resolution line.
+
+This hotfix also normalizes HDMI OSD size by external video mode:
+
+| Output | OSD scale |
+|---|---:|
+| 1280x720 | 66.7% |
+| 1920x1080 | 100% |
+| 2560x1440 | 150% |
+| 3840x2160 | 200% |
+
+Intermediate modes are interpolated. Metal clipping now uses the active
+drawable texture dimensions, and performance-overlay positioning is clamped
+to the viewport to prevent right-edge clipping during 4K mode changes.
+
+The public hotfix version is **2.6.7.1**. To keep Apple bundle metadata valid,
+the IPA uses `CFBundleShortVersionString=2.6.7`,
+`CFBundleVersion=2671`, and exposes `ARMSX2ReleaseVersion=2.6.7.1` in
+the app UI and troubleshooting information.
+
+The 2.6.7.1 simulator build has been compiled, installed, and launched. Physical
+1080p/1440p/4K output validation is intentionally pending on the iPhone 17 Pro
+Max before this hotfix branch is proposed upstream.
 
 See [iOS Dedicated HDMI Output — Upstream PR Handoff](IOS_DEDICATED_HDMI_PR.md)
 for the architecture, lifecycle, validation status, known limitations, and
 physical-device test checklist.
+
+See [iOS HDMI OSD Viewport and Scaling — 2.6.7.1 Hotfix](IOS_HDMI_OSD_VIEWPORT_2.6.7.1.md)
+for the implementation and validation notes specific to this follow-up.
 
 ## System Requirements
 

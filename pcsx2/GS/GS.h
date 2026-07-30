@@ -100,6 +100,8 @@ void GSSetPortraitRenderTopAlign(bool enabled);
 /// Pixels kept clear at the top of a portrait window (display cutout / camera).
 void GSSetPortraitRenderTopInset(int pixels);
 bool GSHasDisplayWindow();
+/// Returns the visual OSD scale for an external video mode. 1080p is the 100% baseline.
+float GSCalculateExternalDisplayOSDScale(u32 width, u32 height);
 void GSResizeDisplayWindow(u32 width, u32 height, float scale);
 void GSUpdateDisplayWindow();
 void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);

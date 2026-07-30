@@ -31,6 +31,7 @@
 #include "common/ProgressCallback.h"
 #include "common/Error.h"
 #include "pcsx2/Input/InputManager.h"
+#include "pcsx2/GS/GS.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadDualshock2.h"
 #include "pcsx2/Counters.h" // g_FrameCount
@@ -93,7 +94,6 @@ UITextView* g_logView = nil;
 // Game render view with CAMetalLayer as backing layer (like MTKView)
 // Game render view — backing layer (CAMetalLayer), manual landscape toggle
 #include "pcsx2/MTGS.h"
-extern void GSResizeDisplayWindow(u32 width, u32 height, float scale);
 
 #pragma mark - Init helpers
 static std::vector<u8> s_imguiStandardFontData;
@@ -336,7 +336,10 @@ void ARMSX2ConfigureImGuiFonts(const char* reason)
 
     int w = std::max(1, (int)(drawableSize.width + 0.5));
     int h = std::max(1, (int)(drawableSize.height + 0.5));
-    float s = (float)scale;
+    const bool dedicatedExternal = (self != g_gameRenderView);
+    float s = dedicatedExternal ?
+        GSCalculateExternalDisplayOSDScale(static_cast<u32>(w), static_cast<u32>(h)) :
+        static_cast<float>(scale);
 
     // Keep corner-anchored OSD out of the notch, the Dynamic Island and the home indicator. UIKit
     // already knows where those are; a flat constant was both too much on a device with square
@@ -875,7 +878,7 @@ void ARMSX2SanitizeFrameLimiterConfig(const char* reason)
 }
 
 void ARMSX2SetIOSOsdFlags(bool show_fps, bool show_vps, bool show_speed, bool show_cpu,
-    bool show_gpu, bool show_resolution, bool show_gs_stats, bool show_indicators,
+    bool show_gpu, bool show_resolution, bool show_viewport, bool show_gs_stats, bool show_indicators,
     bool show_settings, bool show_inputs, bool show_frame_times, bool show_version,
     bool show_hardware_info)
 {
@@ -892,6 +895,7 @@ void ARMSX2SetIOSOsdFlags(bool show_fps, bool show_vps, bool show_speed, bool sh
     EmuConfig.GS.OsdShowCPU = show_cpu;
     EmuConfig.GS.OsdShowGPU = show_gpu;
     EmuConfig.GS.OsdShowResolution = show_resolution;
+    EmuConfig.GS.OsdShowViewport = show_viewport;
     EmuConfig.GS.OsdShowGSStats = show_gs_stats;
     EmuConfig.GS.OsdShowIndicators = show_indicators;
     EmuConfig.GS.OsdShowSettings = show_settings;
@@ -914,6 +918,7 @@ void ARMSX2WriteIOSOsdFlagsToSettings()
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowCPU", EmuConfig.GS.OsdShowCPU);
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowGPU", EmuConfig.GS.OsdShowGPU);
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowResolution", EmuConfig.GS.OsdShowResolution);
+    s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowViewport", EmuConfig.GS.OsdShowViewport);
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowGSStats", EmuConfig.GS.OsdShowGSStats);
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowIndicators", EmuConfig.GS.OsdShowIndicators);
     s_settings_interface->SetBoolValue("EmuCore/GS", "OsdShowSettings", EmuConfig.GS.OsdShowSettings);
@@ -937,6 +942,7 @@ void ARMSX2ApplyIOSOsdPresetFromConfig(const char* reason)
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowCPU", false),
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowGPU", false),
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowResolution", false),
+        s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowViewport", false),
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowGSStats", false),
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowIndicators", false),
         s_settings_interface->GetBoolValue("EmuCore/GS", "OsdShowSettings", false),
@@ -954,12 +960,13 @@ void ARMSX2ApplyIOSOsdPresetFromConfig(const char* reason)
     // needs it is the only one running after the GS opens, and it pushes there.
     EmuConfig.GS.OsdPerformancePos = static_cast<OsdOverlayPos>(position);
 
-    Console.WriteLn("@@OSD@@ preset=%d position=%d reason=%s fps=%d vps=%d speed=%d gpu=%d device_stats=%d frame_times=%d version=%d hardware=%d",
+    Console.WriteLn("@@OSD@@ preset=%d position=%d reason=%s fps=%d vps=%d speed=%d gpu=%d viewport=%d device_stats=%d frame_times=%d version=%d hardware=%d",
         s_settings_interface->GetIntValue("ARMSX2iOS/UI", "OsdPreset", 0), position, reason ? reason : "unknown",
         EmuConfig.GS.OsdShowFPS ? 1 : 0,
         EmuConfig.GS.OsdShowVPS ? 1 : 0,
         EmuConfig.GS.OsdShowSpeed ? 1 : 0,
         EmuConfig.GS.OsdShowGPU ? 1 : 0,
+        EmuConfig.GS.OsdShowViewport ? 1 : 0,
         ARMSX2_iOSShouldShowDeviceStatsOverlay() ? 1 : 0,
         EmuConfig.GS.OsdShowFrameTimes ? 1 : 0,
         EmuConfig.GS.OsdShowVersion ? 1 : 0,

@@ -11,6 +11,11 @@ historical record for the first version of the feature. This document is the
 PR-oriented description of the final implementation after the subsequent UI,
 localization, OSD, controller, OLED-background, and pause-menu fixes.
 
+The later 2.6.7.1 viewport/scaling hotfix is documented separately in
+[`IOS_HDMI_OSD_VIEWPORT_2.6.7.1.md`](IOS_HDMI_OSD_VIEWPORT_2.6.7.1.md).
+Its physical-device validation and upstream submission remain intentionally
+separate from the already-approved 2.6.7 baseline described here.
+
 ## Repository lineage
 
 The first working copy, `moesuito/armsx2-main`, came from a GitHub source ZIP.

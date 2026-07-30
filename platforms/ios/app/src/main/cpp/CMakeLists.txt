@@ -15,7 +15,11 @@ set(ARMSX2_VERSION_MAJOR 2)
 set(ARMSX2_VERSION_MINOR 6)
 set(ARMSX2_VERSION_PATCH 7)
 set(ARMSX2_VERSION "${ARMSX2_VERSION_MAJOR}.${ARMSX2_VERSION_MINOR}.${ARMSX2_VERSION_PATCH}")
-set(ARMSX2_BUILD_NUMBER 267)
+# Apple requires CFBundleShortVersionString to have exactly three numeric
+# components. Keep the hotfix's public version separately and encode its fourth
+# component in CFBundleVersion.
+set(ARMSX2_RELEASE_VERSION "2.6.7.1")
+set(ARMSX2_BUILD_NUMBER 2671)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	set(CMAKE_C_COMPILER_WORKS 1)
@@ -59,7 +63,7 @@ endif()
 # Project Name
 project(ARMSX2iOS VERSION ${ARMSX2_VERSION} LANGUAGES C CXX)
 
-add_compile_definitions(ARMSX2_VERSION_STR="${ARMSX2_VERSION}")
+add_compile_definitions(ARMSX2_VERSION_STR="${ARMSX2_RELEASE_VERSION}")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	set(_M_ARM64 TRUE)
@@ -353,7 +357,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	target_compile_definitions(ARMSX2iOS PRIVATE
 		PCSX2_NO_PCAP=1
 		ARMSX2_GIT_HASH="${ARMSX2_GIT_HASH}"
-		ARMSX2_VERSION_STR="${ARMSX2_VERSION}"
+		ARMSX2_VERSION_STR="${ARMSX2_RELEASE_VERSION}"
 	)
 	if(ARMSX2_MAC_CATALYST)
 		target_compile_definitions(ARMSX2iOS PRIVATE ARMSX2_MAC_CATALYST_BUILD=1)

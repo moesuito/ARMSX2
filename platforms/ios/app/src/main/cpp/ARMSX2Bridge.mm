@@ -2538,7 +2538,9 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
 }
 
 + (nonnull NSString *)buildVersion {
-    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"ARMSX2ReleaseVersion"];
+    if (ver.length == 0)
+        ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
     return [NSString stringWithFormat:@"ARMSX2 iOS v%@", ver];
 }
 
@@ -3563,6 +3565,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
     const bool cpu = simple || detail || full;
     const bool gpu = detail || full;
     const bool resolution = detail || full;
+    const bool viewport = detail || full;
     const bool indicators = detail || full;
     const bool version = simple || detail || full;
     const bool gsStats = full;
@@ -3583,6 +3586,7 @@ extern "C" void ARMSX2_CaptureGraphicsHackState(void)
         EmuConfig.GS.OsdShowCPU = cpu;
         EmuConfig.GS.OsdShowGPU = gpu;
         EmuConfig.GS.OsdShowResolution = resolution;
+        EmuConfig.GS.OsdShowViewport = viewport;
         EmuConfig.GS.OsdShowGSStats = gsStats;
         EmuConfig.GS.OsdShowFrameTimes = frameTimes;
         EmuConfig.GS.OsdShowVersion = version;

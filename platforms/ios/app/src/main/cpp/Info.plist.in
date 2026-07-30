@@ -284,6 +284,8 @@
     <string>@ARMSX2_VERSION@</string>
     <key>CFBundleVersion</key>
     <string>@ARMSX2_BUILD_NUMBER@</string>
+    <key>ARMSX2ReleaseVersion</key>
+    <string>@ARMSX2_RELEASE_VERSION@</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
