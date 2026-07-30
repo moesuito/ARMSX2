@@ -75,6 +75,11 @@ set(_lrs_cc "${_lrs_tc}/bin/${_lrs_rust_target}${_lrs_api}-clang")
 if(_lrs_rust_target STREQUAL "armv7-linux-androideabi")
 	set(_lrs_cc "${_lrs_tc}/bin/armv7a-linux-androideabi${_lrs_api}-clang")
 endif()
+set(_lrs_cxx "${_lrs_cc}++")
+if(CMAKE_HOST_WIN32)
+	set(_lrs_cc "${_lrs_cc}.cmd")
+	set(_lrs_cxx "${_lrs_cxx}.cmd")
+endif()
 
 if(NOT EXISTS "${_lrs_cc}")
 	message(STATUS "librashader: no NDK clang at ${_lrs_cc} -> DISABLED.")
@@ -110,7 +115,7 @@ add_custom_command(
 	COMMAND ${CMAKE_COMMAND} -E env
 		"CARGO_TARGET_${_lrs_target_upper}_LINKER=${_lrs_cc}"
 		"CC_${_lrs_target_under}=${_lrs_cc}"
-		"CXX_${_lrs_target_under}=${_lrs_cc}++"
+		"CXX_${_lrs_target_under}=${_lrs_cxx}"
 		"AR_${_lrs_target_under}=${_lrs_tc}/bin/llvm-ar"
 		"RANLIB_${_lrs_target_under}=${_lrs_tc}/bin/llvm-ranlib"
 		# rustc does NOT emit a SONAME for an Android cdylib. Without one the linker
