@@ -126,6 +126,7 @@ static std::deque<std::function<void()>> s_cpu_thread_queue;
 static std::thread::id s_cpu_thread_id;
 int s_window_width = 0;
 int s_window_height = 0;
+bool s_window_dedicated_output = false;
 // Display refresh rate (Hz) reported by the Kotlin surface layer via
 // setDisplayRefreshRate(). 0 = unknown -> throttle/pacing falls back to 60Hz.
 // Populated so high-refresh handhelds (90/120Hz) pace against the real panel
@@ -2036,7 +2037,8 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setDisplayRefreshRate(JNIEnv *env, jclass c
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_onNativeSurfaceChanged(JNIEnv *env, jclass clazz,
-                                                            jobject p_surface, jint p_width, jint p_height) {
+                                                            jobject p_surface, jint p_width, jint p_height,
+                                                            jboolean p_dedicated_output) {
     {
         std::lock_guard<std::mutex> lock(s_window_mutex);
         if(s_window) {
@@ -2050,6 +2052,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_onNativeSurfaceChanged(JNIEnv *env, jclass 
             s_window_width = p_width;
             s_window_height = p_height;
         }
+        s_window_dedicated_output = (p_dedicated_output == JNI_TRUE);
     }
 
     // SurfaceHolder.Callback runs on the Android UI thread (EmulationSurface.kt), and this fires
@@ -2074,6 +2077,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_onNativeSurfaceDestroyed(JNIEnv *env, jclas
             ANativeWindow_release(s_window);
             s_window = nullptr;
         }
+        s_window_dedicated_output = false;
     }
     // Tear the swapchain down now rather than letting the GS thread keep
     // presenting into the dead window until a failed present forces a
@@ -2115,6 +2119,7 @@ std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
     // onNativeSurfaceChanged triggers MTGS::UpdateDisplayWindow and we
     // re-acquire the real surface.
     if (!s_window) {
+        GSSetDedicatedExternalDisplayActive(false);
         _windowInfo.type = WindowInfo::Type::Surfaceless;
         return _windowInfo;
     }
@@ -2125,8 +2130,9 @@ std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
     ANativeWindow_acquire(s_window);
     s_acquired_window = s_window;
 
-    float _fScale = 1.0;
-    if (s_window_width > 0 && s_window_height > 0) {
+    GSSetDedicatedExternalDisplayActive(s_window_dedicated_output);
+    float _fScale = GSCalculateExternalDisplayOSDScale(s_window_width, s_window_height);
+    if (!s_window_dedicated_output && s_window_width > 0 && s_window_height > 0) {
         int _nSize = s_window_width;
         if (s_window_width <= s_window_height) {
             _nSize = s_window_height;
@@ -2146,6 +2152,7 @@ std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
 
 void Host::ReleaseRenderWindow() {
     std::lock_guard<std::mutex> lock(s_window_mutex);
+    GSSetDedicatedExternalDisplayActive(false);
     if (s_acquired_window) {
         ANativeWindow_release(s_acquired_window);
         s_acquired_window = nullptr;

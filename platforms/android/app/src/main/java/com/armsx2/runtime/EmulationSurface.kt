@@ -16,14 +16,21 @@ import kr.co.iefriends.pcsx2.NativeApp
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-class EmulationSurface(context: Context) :
+class EmulationSurface(
+    context: Context,
+    private val dedicatedOutput: Boolean = false,
+) :
     SurfaceView(context),
     SurfaceHolder.Callback,
     DisplayManager.DisplayListener {
     private var viewWidth = 0
     private var viewHeight = 0
+    private var surfaceWidth = 0
+    private var surfaceHeight = 0
+    private var renderTargetActive = !dedicatedOutput
     private var gameActive = false
     private var lastRequestedFrameRate = Float.NaN
+    var onSurfaceAvailabilityChanged: ((Boolean) -> Unit)? = null
     private val displayManager =
         context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     private val frameRateMonitor = object : Runnable {
@@ -72,10 +79,25 @@ class EmulationSurface(context: Context) :
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        surfaceWidth = width
+        surfaceHeight = height
+        if (renderTargetActive)
+            publishSurface()
+        onSurfaceAvailabilityChanged?.invoke(true)
+    }
+
+    private fun publishSurface() {
+        if (!holder.surface.isValid || surfaceWidth <= 0 || surfaceHeight <= 0) return
         reportActualDisplayRefreshRate()
         applyFrameRatePreference()
-        pushDisplayCutoutInset(width, height)
-        NativeApp.onNativeSurfaceChanged(holder.surface, width, height)
+        if (!dedicatedOutput)
+            pushDisplayCutoutInset(surfaceWidth, surfaceHeight)
+        NativeApp.onNativeSurfaceChanged(
+            holder.surface,
+            surfaceWidth,
+            surfaceHeight,
+            dedicatedOutput,
+        )
     }
 
     /**
@@ -98,7 +120,11 @@ class EmulationSurface(context: Context) :
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surfaceWidth = 0
+        surfaceHeight = 0
         lastRequestedFrameRate = Float.NaN
+        onSurfaceAvailabilityChanged?.invoke(false)
+        if (!renderTargetActive) return
         // ★ onNativeSurfaceDestroyed(), NOT onNativeSurfaceChanged(null, 0, 0). Both null s_window,
         // but the latter gates its MTGS::UpdateDisplayWindow() repost on `width > 0 && height > 0`
         // — false here — so the GS thread was NEVER told the surface died. It could then sit in
@@ -110,12 +136,26 @@ class EmulationSurface(context: Context) :
         NativeApp.onNativeSurfaceDestroyed()
     }
 
+    /**
+     * Hands the single native renderer between the phone and presentation surfaces.
+     * Deactivating never destroys the native window: the new owner replaces it atomically.
+     */
+    fun setRenderTargetActive(active: Boolean) {
+        if (renderTargetActive == active) return
+        renderTargetActive = active
+        if (active) {
+            publishSurface()
+        } else {
+            clearFrameRatePreference()
+        }
+    }
+
     override fun onDisplayAdded(displayId: Int) = Unit
 
     override fun onDisplayRemoved(displayId: Int) = Unit
 
     override fun onDisplayChanged(displayId: Int) {
-        if (displayId != currentDisplay()?.displayId) return
+        if (!renderTargetActive || displayId != currentDisplay()?.displayId) return
         reportActualDisplayRefreshRate()
     }
 
@@ -147,6 +187,7 @@ class EmulationSurface(context: Context) :
      */
     fun applyFrameRatePreference() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+            !renderTargetActive ||
             !gameActive ||
             !holder.surface.isValid ||
             !lowLatencyEnabled()
@@ -266,8 +307,9 @@ class EmulationSurface(context: Context) :
         // e.g. a 1920x1080 panel mis-reported as 1920x1200 which squishes 16:9 games — issue #398),
         // otherwise the SurfaceView's laid-out size.
         val override = parseResOverride(effective.screenResOverride)
-        val baseW = override?.first ?: viewWidth
-        val baseH = override?.second ?: viewHeight
+        val displaySize = if (dedicatedOutput) physicalDisplaySize() else null
+        val baseW = override?.first ?: displaySize?.first ?: viewWidth
+        val baseH = override?.second ?: displaySize?.second ?: viewHeight
 
         // hwScaler (if > 0) downscales the short side to 448*multiplier for weak GPUs, applied to
         // whatever base we picked above.
@@ -277,7 +319,7 @@ class EmulationSurface(context: Context) :
 
         // With no override and no downscale, let the surface track the layout (native panel size) —
         // the original behavior. Otherwise pin an explicit buffer size and let the compositor scale.
-        if (override == null && scale == 1f) {
+        if (override == null && displaySize == null && scale == 1f) {
             holder.setSizeFromLayout()
             return
         }
@@ -298,6 +340,17 @@ class EmulationSurface(context: Context) :
 
     private fun currentDisplay(): Display? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) context.display else display
+
+    private fun physicalDisplaySize(): Pair<Int, Int>? {
+        val mode = currentDisplay()?.mode ?: return null
+        val displayIsLandscape = mode.physicalWidth >= mode.physicalHeight
+        val viewIsLandscape = viewWidth >= viewHeight
+        return if (displayIsLandscape == viewIsLandscape) {
+            Pair(mode.physicalWidth, mode.physicalHeight)
+        } else {
+            Pair(mode.physicalHeight, mode.physicalWidth)
+        }
+    }
 
     private fun currentDisplayRefreshHz(): Float =
         runCatching { currentDisplay()?.refreshRate ?: 0f }.getOrDefault(0f)

@@ -676,9 +676,9 @@ void GSRenderer::EndPresentFrame()
 	if (!GSIsDedicatedExternalDisplayActive())
 		FullscreenUI::Render();
 
-	// Dedicated HDMI owns a separate Metal surface, so rendering the normal OSD
+	// Dedicated HDMI owns a separate platform surface, so rendering the normal OSD
 	// here places performance metrics and notifications on the television while
-	// the iPhone remains a clean companion screen.
+	// here keeps the phone as a clean companion screen.
 	ImGuiManager::RenderOSD();
 	g_gs_device->EndPresent();
 	ImGuiManager::NewFrame();

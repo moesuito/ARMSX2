@@ -656,7 +656,7 @@ public class NativeApp {
 	public static native boolean isMemoryCard(String name);
 
 	public static native void onNativeSurfaceCreated();
-	public static native void onNativeSurfaceChanged(Surface surface, int w, int h);
+	public static native void onNativeSurfaceChanged(Surface surface, int w, int h, boolean dedicatedOutput);
 	public static native void onNativeSurfaceDestroyed();
 	public static native void setDisplayRefreshRate(float hz);
 

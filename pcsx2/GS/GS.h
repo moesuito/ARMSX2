@@ -108,7 +108,7 @@ void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();
-// Host presentation policy used by the iOS dedicated external-display path.
+// Host presentation policy used by dedicated external-display paths.
 // This never changes persisted GS settings or emulation timing.
 void GSSetDedicatedExternalDisplayActive(bool active);
 bool GSIsDedicatedExternalDisplayActive();
