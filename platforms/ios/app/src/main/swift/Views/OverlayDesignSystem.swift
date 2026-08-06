@@ -69,6 +69,14 @@ enum OverlayTheme {
     static let glassTopHighlight = Color.white.opacity(0.10)
     static let cardTopHighlight = Color.white.opacity(0.07)
     static let cardShadow = Color.black.opacity(0.18)
+
+    // MARK: Row metrics — the icon column every overlay row shares
+
+    /// Icon column width. Every row title starts at `rowLabelInset` so they line up down the card.
+    static let rowIconWidth: CGFloat = 22
+    static let rowIconSpacing: CGFloat = 12
+    /// Where a row title starts. Use this to hang anything under a row, don't re-add the two.
+    static let rowLabelInset: CGFloat = rowIconWidth + rowIconSpacing
 }
 
 // MARK: - Overlay Components
@@ -107,10 +115,21 @@ private struct OverlayCompactKey: EnvironmentKey {
     static let defaultValue: Bool = false
 }
 
+private struct OverlayKeyboardOverlapKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
 extension EnvironmentValues {
     var overlayCompact: Bool {
         get { self[OverlayCompactKey.self] }
         set { self[OverlayCompactKey.self] = newValue }
+    }
+
+    /// How much of the overlay card the keyboard covers. The panel insets itself by this,
+    /// since an inset applied out here would shrink the box it measures itself in.
+    var overlayKeyboardOverlap: CGFloat {
+        get { self[OverlayKeyboardOverlapKey.self] }
+        set { self[OverlayKeyboardOverlapKey.self] = newValue }
     }
 }
 
@@ -282,6 +301,22 @@ struct OverlayHeader: View {
 
 // MARK: - Rows
 
+/// Puts a plain `Label` on the same icon column as the rows below, so an injected `Menu` lines up
+/// with the hand-built rows either side of it instead of using `Label`'s own narrower icon slot.
+struct OverlayRowLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: OverlayTheme.rowIconSpacing) {
+            configuration.icon
+                .frame(width: OverlayTheme.rowIconWidth)
+                .foregroundStyle(OverlayTheme.textSecondary)
+            configuration.title
+                .foregroundStyle(OverlayTheme.textPrimary)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+    }
+}
+
 /// A fixed-min-height overlay action row that GUARANTEES the main label wins over a trailing
 /// value: the label gets `layoutPriority(1)` and the trailing value `layoutPriority(-1)` with tail
 /// truncation, so on a narrow width the trailing value elides first while the label stays intact.
@@ -309,10 +344,10 @@ struct OverlayActionRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: OverlayTheme.rowIconSpacing) {
                 if let systemImage {
                     Image(systemName: systemImage)
-                        .frame(width: 22)
+                        .frame(width: OverlayTheme.rowIconWidth)
                         .foregroundStyle(isDestructive ? OverlayTheme.destructive : OverlayTheme.textSecondary)
                 }
                 Text(label)
@@ -351,9 +386,9 @@ struct OverlayToggleRow: View {
 
     var body: some View {
         Toggle(isOn: $isOn) {
-            HStack(spacing: 12) {
+            HStack(spacing: OverlayTheme.rowIconSpacing) {
                 Image(systemName: systemImage)
-                    .frame(width: 22)
+                    .frame(width: OverlayTheme.rowIconWidth)
                     .foregroundStyle(OverlayTheme.textSecondary)
                 Text(label)
                     .foregroundStyle(OverlayTheme.textPrimary)

@@ -1492,6 +1492,7 @@ protected:
 	} m_index = {};
 
 	u32 m_frame = 0; // for ageing the pool
+	u32 m_frames_since_pool_cleanup = 0;
 
 private:
 	std::array<FastList<GSTexture*>, 2> m_pool; // [texture, target]
@@ -1589,6 +1590,12 @@ protected:
 	}
 	void DoStretchRectWithAssertions(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 		ShaderConvertSelector shader, Filter filter);
+
+	/// Serves a StretchRect through CopyRect when the two are equivalent, returning whether it did.
+	/// A stretch is a draw, so it needs a render pass of its own and the pass it interrupted has to
+	/// be restarted afterwards -- two pass boundaries where an image copy costs one.
+	bool TryStretchRectAsCopy(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+		ShaderConvertSelector shader);
 
 	/// Backend entry points for work that reads or writes texture contents. These are
 	/// reached only through the public non-virtual wrappers of the same name, which run
@@ -1974,6 +1981,7 @@ public:
 	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
 
 	void AgePool();
+	void AgePoolAfterPresentCapSkip();
 	void PurgePool();
 
 	__fi static constexpr bool IsDualSourceBlendFactor(u8 factor)

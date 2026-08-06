@@ -207,6 +207,60 @@ fun AppTab() {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Opt into the lightweight 2D animated backdrop everywhere (the same one older Mali /
+            // GL-fail devices already get) instead of the GLES3 XMB wave. The colour options below
+            // apply to it too. No effect if a custom background image is set.
+            ToggleRow(
+                label = str("app.bg.simple"),
+                value = com.armsx2.ui.home.LibraryBackground.animated2D.value,
+                description = str("app.bg.simple.desc"),
+                onChange = { com.armsx2.ui.home.LibraryBackground.setAnimated2D(it) },
+            )
+            // Colour of the BAR itself (the rounded header pill), as opposed to the animated
+            // backdrop the rest of this section controls. Requested because the background picker
+            // is labelled "Library Bar Color" but recolours the background — so there was no way to
+            // colour the actual bar. "Default" hands it back to the theme.
+            run {
+                val barArgb = com.armsx2.ui.theme.LibraryChromePreferences.barColor.value
+                Spacer(Modifier.height(10.dp))
+                Text(str("app.barColor"), style = MaterialTheme.typography.titleMedium)
+                Text(
+                    str("app.barColor.desc"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    verticalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    val clearBar = { com.armsx2.ui.theme.LibraryChromePreferences.setBarColor(0) }
+                    FilterChip(
+                        selected = barArgb == 0,
+                        onClick = clearBar,
+                        label = { Text(str("app.barColor.default")) },
+                        shape = RoundedCornerShape(11.dp),
+                        modifier = Modifier.controllerFocusable(
+                            "app.barColor.default", RoundedCornerShape(11.dp), onConfirm = clearBar,
+                        ),
+                    )
+                    com.armsx2.ui.theme.LibraryChromePreferences.BAR_PRESETS.forEach { preset ->
+                        val pick = { com.armsx2.ui.theme.LibraryChromePreferences.setBarColor(preset) }
+                        val selected = barArgb == preset
+                        Surface(
+                            onClick = pick,
+                            modifier = Modifier.size(34.dp)
+                                .controllerFocusable("app.barColor.$preset", RoundedCornerShape(9.dp), onConfirm = pick),
+                            shape = RoundedCornerShape(9.dp),
+                            color = Color(preset),
+                            border = BorderStroke(
+                                if (selected) 3.dp else 1.dp,
+                                if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                            ),
+                        ) {}
+                    }
+                }
+            }
             // Continuous RGB hue-cycle — same idea as the theme's RGB mode. While on, the fixed
             // color (presets + sliders) doesn't apply, so it's hidden.
             ToggleRow(
@@ -335,6 +389,29 @@ fun AppTab() {
         )
 
         ToggleRow(
+            label = str("secondScreen.label"),
+            value = com.armsx2.SecondScreen.enabled.value,
+            description = str("secondScreen.desc"),
+            onChange = { com.armsx2.SecondScreen.set(appContext, it) },
+        )
+
+        if (com.armsx2.SecondScreen.enabled.value) {
+            ToggleRow(
+                label = str("secondScreen.moveOsd"),
+                value = com.armsx2.SecondScreen.moveOsd.value,
+                description = str("secondScreen.moveOsd.desc"),
+                onChange = { com.armsx2.SecondScreen.setMoveOsd(it) },
+            )
+        }
+
+        ToggleRow(
+            label = str("app.batteryWarnings"),
+            value = com.armsx2.BatteryWatcher.enabled.value,
+            description = str("app.batteryWarnings.desc"),
+            onChange = { com.armsx2.BatteryWatcher.set(it) },
+        )
+
+        ToggleRow(
             label = str("app.libraryMusic"),
             value = com.armsx2.LibraryMusic.enabled.value,
             description = str("app.libraryMusic.desc"),
@@ -383,6 +460,60 @@ fun AppTab() {
                         onClick = reset,
                         modifier = Modifier.controllerFocusable("app.libraryMusic.reset", onConfirm = reset),
                     ) { Text(str("app.libraryMusic.reset")) }
+                }
+            }
+        }
+
+        // In-game pause music. Separate track and separate toggle from the library's: the pause
+        // menu was silent, and people sit in it browsing settings mid-game. Off by default —
+        // audio starting when you open a menu is startling if you didn't ask for it.
+        ToggleRow(
+            label = str("app.pauseMusic"),
+            value = com.armsx2.PauseMusic.enabled.value,
+            description = str("app.pauseMusic.desc"),
+            onChange = { com.armsx2.PauseMusic.set(appContext, it) },
+        )
+        if (com.armsx2.PauseMusic.enabled.value) {
+            IntSliderRow(
+                label = str("app.pauseMusic.volume"),
+                value = com.armsx2.PauseMusic.volumePercent.value,
+                min = 0,
+                max = 100,
+                valueFormatter = { "$it%" },
+                onChange = { com.armsx2.PauseMusic.setVolume(it) },
+            )
+            val pausePicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocument()
+            ) { uri ->
+                if (uri != null) {
+                    val name = androidx.documentfile.provider.DocumentFile
+                        .fromSingleUri(appContext, uri)?.name ?: "Custom track"
+                    com.armsx2.PauseMusic.setCustomTrack(appContext, uri, name)
+                }
+            }
+            val pauseCustom = com.armsx2.PauseMusic.customName.value
+            Text(
+                if (pauseCustom != null) str("app.pauseMusic.current").format(pauseCustom)
+                else str("app.pauseMusic.default"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val pickPause = { pausePicker.launch(arrayOf("audio/*")) }
+                OutlinedButton(
+                    onClick = pickPause,
+                    modifier = Modifier.controllerFocusable("app.pauseMusic.choose", onConfirm = pickPause),
+                ) { Text(str("app.pauseMusic.choose")) }
+                if (pauseCustom != null) {
+                    val resetPause = { com.armsx2.PauseMusic.clearCustomTrack(appContext) }
+                    OutlinedButton(
+                        onClick = resetPause,
+                        modifier = Modifier.controllerFocusable("app.pauseMusic.reset", onConfirm = resetPause),
+                    ) { Text(str("app.pauseMusic.reset")) }
                 }
             }
         }
@@ -636,6 +767,21 @@ private fun BackupRestoreRows() {
 
     BackupActionRow("💾", "app.backup.export", "app.backup.export.desc", status, busy, doExport)
     BackupActionRow("📥", "app.backup.import", "app.backup.import.desc", "", busy, doImport)
+
+    // Factory reset. Sits with Backup/Restore because Export is the thing to do first — the
+    // prompt says so. Routed through GlobalConfirm rather than a local overlay: this row is
+    // inside a scrolling tab, so a scrim drawn here would clip to the row's bounds.
+    val doReset = {
+        if (!busy) {
+            com.armsx2.ui.common.GlobalConfirm.ask(
+                title = I18n.get("app.reset.title"),
+                message = I18n.get("app.reset.message"),
+                confirmLabel = I18n.get("app.reset.confirm"),
+                destructive = true,
+            ) { MainActivityRuntime.resetAppToDefaults(context) }
+        }
+    }
+    BackupActionRow("♻️", "app.reset", "app.reset.desc", "", busy, doReset)
 }
 
 @Composable

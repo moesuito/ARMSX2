@@ -59,7 +59,7 @@ static __ri bool _vuFMACflush(VURegs* VU)
 		if (VU->fmac[i].flagreg & (1 << REG_STATUS_FLAG))
 			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0x30) | (VU->fmac[i].statusflag & 0xFC0) | (VU->fmac[i].statusflag & 0xF);
 		else
-			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFF0) | (VU->fmac[i].statusflag & 0xF) | ((VU->fmac[i].statusflag & 0xF) << 6);
+			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFF0) | (VU->fmac[i].statusflag & 0xFC0) | (VU->fmac[i].statusflag & 0xF);
 		VU->VI[REG_MAC_FLAG].UL = VU->fmac[i].macflag;
 
 		VU->fmacreadpos = (VU->fmacreadpos + 1) & 3;
@@ -163,7 +163,7 @@ void _vuFlushAll(VURegs* VU)
 		if (VU->fmac[i].flagreg & (1 << REG_STATUS_FLAG))
 			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0x30) | (VU->fmac[i].statusflag & 0xFC0) | (VU->fmac[i].statusflag & 0xF);
 		else
-			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFF0) | (VU->fmac[i].statusflag & 0xF) | ((VU->fmac[i].statusflag & 0xF) << 6);
+			VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFF0) | (VU->fmac[i].statusflag & 0xFC0) | (VU->fmac[i].statusflag & 0xF);
 		VU->VI[REG_MAC_FLAG].UL = VU->fmac[i].macflag;
 
 		VU->fmacreadpos = (VU->fmacreadpos + 1) & 3;
@@ -928,6 +928,23 @@ static __fi void _vuCLIP(VURegs* VU)
 /*   VU Lower instructions    */
 /******************************/
 
+// Raise the sticky D/I bits (STATUS 11:10) for whichever current D/I bits
+// (STATUS 5:4) the div-unit op just set. Hardware sets the sticky bit whenever
+// it sets the corresponding cause bit, and the sticky field only ever
+// accumulates -- it is cleared by an explicit FSSET, not by a later op.
+//
+// Without this, VU->statusflag never carries a sticky bit at all, so the
+// snapshot _vuFDIVAdd hands to the pipeline (VU->fdiv.statusflag) has nothing
+// sticky in it and _vuFDIVflush's `& 0xC30` contributes only the cause bits --
+// the micro path set NO sticky D or I ever. microVU already accumulates them.
+//
+// The macro path is unaffected: SYNCFDIV derives the sticky field from the
+// cause bits itself (`(statusflag & 0x30) << 6`) and masks these bits out.
+static __fi void VU_STICKY_DI(VURegs* VU)
+{
+	VU->statusflag |= (VU->statusflag & 0x30) << 6;
+}
+
 static __fi void _vuDIV(VURegs* VU)
 {
 	float ft = vuDouble(VU->VF[_Ft_].UL[_Ftf_]);
@@ -953,6 +970,8 @@ static __fi void _vuDIV(VURegs* VU)
 		VU->q.F = fs / ft;
 		VU->q.F = vuDouble(VU->q.UL);
 	}
+
+	VU_STICKY_DI(VU);
 }
 
 static __fi void _vuSQRT(VURegs* VU)
@@ -965,6 +984,8 @@ static __fi void _vuSQRT(VURegs* VU)
 		VU->statusflag |= 0x10;
 	VU->q.F = sqrt(fabs(ft));
 	VU->q.F = vuDouble(VU->q.UL);
+
+	VU_STICKY_DI(VU);
 }
 
 static __fi void _vuRSQRT(VURegs* VU)
@@ -1009,6 +1030,8 @@ static __fi void _vuRSQRT(VURegs* VU)
 		VU->q.F = fs / temp;
 		VU->q.F = vuDouble(VU->q.UL);
 	}
+
+	VU_STICKY_DI(VU);
 }
 
 static __fi void _vuIADDI(VURegs* VU)
@@ -1693,8 +1716,16 @@ static __ri void _vuERLENG(VURegs* VU)
 }
 
 
+// These are the EFU's atan series, the same table microVU keeps in
+// mVU_Globals as T1/T5/T2/T3/T4/T6/T7/T8 + Pi4 (microVU_Misc.h) -- all nine
+// re-encode to those globals bit for bit, so if one ever stops doing so,
+// suspect the transcription rather than the hardware. eatanconst[3] did
+// exactly that: it read -0.13085337519646f (0xBE05FE6D), T3's decimal
+// -0.139085337519646 with the first 9 dropped, and it cost up to 3383 ULP
+// against the ps2autotests EFU capture (worst at CVF_3PI_OVER2, since the
+// error goes as the reduced argument to the seventh power).
 static __ri float _vuCalculateEATAN(float inputvalue) {
-	float eatanconst[9] = { 0.999999344348907f, -0.333298563957214f, 0.199465364217758f, -0.13085337519646f,
+	float eatanconst[9] = { 0.999999344348907f, -0.333298563957214f, 0.199465364217758f, -0.139085337519646f,
 							0.096420042216778f, -0.055909886956215f, 0.021861229091883f, -0.004054057877511f,
 							0.785398185253143f };
 
@@ -1709,30 +1740,44 @@ static __ri float _vuCalculateEATAN(float inputvalue) {
 	return result;
 }
 
+// _vuCalculateEATAN evaluates the EFU's atan polynomial and then adds
+// eatanconst[8] = 0.785398185 = pi/4. That constant is only correct as the
+// second half of the range-reduction identity
+//
+//     atan(x) = pi/4 + atan((x - 1) / (x + 1))
+//
+// so the polynomial must be fed the REDUCED argument, not the raw one. Both
+// recompilers do exactly that -- arm64 `mVU_EATAN` computes (Fs-1)/(Fs+1)
+// before calling mVU_EATAN_arm, x86 `mVU_EATAN` the identical SUBSS/ADDSS/
+// DIVSS -- and the interpreter did not, so it was adding a pi/4 offset that
+// nothing had earned. Confirmed by arithmetic rather than by reading: for
+// Fs = 1.0 the unreduced expression evaluates to 0x3FCA1D99, which is
+// bit-for-bit the value the interpreter produced, while the reduced one gives
+// 0x3F490FDB, bit-for-bit the recompilers' (console: 0x3F490FDA).
+//
+// The xy/xz forms reduce the same identity for atan(y/x):
+//     (y/x - 1) / (y/x + 1) == (y - x) / (y + x)
+// which is the form both recompilers emit, and it removes the need for the
+// old `if (x != 0)` guard -- that guard returned +0 where both recompilers
+// and the console return a NaN pattern.
 static __ri void _vuEATAN(VURegs* VU)
 {
-	float p = _vuCalculateEATAN(vuDouble(VU->VF[_Fs_].UL[_Fsf_]));
-	VU->p.F = p;
+	const float fs = vuDouble(VU->VF[_Fs_].UL[_Fsf_]);
+	VU->p.F = _vuCalculateEATAN((fs - 1.0f) / (fs + 1.0f));
 }
 
 static __ri void _vuEATANxy(VURegs* VU)
 {
-	float p = 0;
-	if (vuDouble(VU->VF[_Fs_].i.x) != 0)
-	{
-		p = _vuCalculateEATAN(vuDouble(VU->VF[_Fs_].i.y) / vuDouble(VU->VF[_Fs_].i.x));
-	}
-	VU->p.F = p;
+	const float x = vuDouble(VU->VF[_Fs_].i.x);
+	const float y = vuDouble(VU->VF[_Fs_].i.y);
+	VU->p.F = _vuCalculateEATAN((y - x) / (y + x));
 }
 
 static __ri void _vuEATANxz(VURegs* VU)
 {
-	float p = 0;
-	if (vuDouble(VU->VF[_Fs_].i.x) != 0)
-	{
-		p = _vuCalculateEATAN(vuDouble(VU->VF[_Fs_].i.z) / vuDouble(VU->VF[_Fs_].i.x));
-	}
-	VU->p.F = p;
+	const float x = vuDouble(VU->VF[_Fs_].i.x);
+	const float z = vuDouble(VU->VF[_Fs_].i.z);
+	VU->p.F = _vuCalculateEATAN((z - x) / (z + x));
 }
 
 static __ri void _vuESUM(VURegs* VU)
@@ -1753,29 +1798,29 @@ static __ri void _vuERCPR(VURegs* VU)
 	VU->p.F = p;
 }
 
+// The EFU square root takes the operand's MAGNITUDE: a negative input is rooted
+// as if positive, it is not passed through unchanged. Both recompilers do this
+// by ANDing the raw bits with absclip before FSQRT (mVU_ESQRT / mVU_ERSQRT);
+// the `p >= 0` guard here returned the operand untouched instead, so ESQRT and
+// ERSQRT of -1.0 gave -1.0 where the console gives 1.0. Masking the sign off the
+// raw bits before vuDouble is the same order the recompilers use.
 static __ri void _vuESQRT(VURegs* VU)
 {
-	float p = vuDouble(VU->VF[_Fs_].UL[_Fsf_]);
+	float p = vuDouble(VU->VF[_Fs_].UL[_Fsf_] & 0x7FFFFFFF);
 
-	if (p >= 0)
-	{
-		p = sqrt(p);
-	}
+	p = sqrt(p);
 
 	VU->p.F = p;
 }
 
 static __ri void _vuERSQRT(VURegs* VU)
 {
-	float p = vuDouble(VU->VF[_Fs_].UL[_Fsf_]);
+	float p = vuDouble(VU->VF[_Fs_].UL[_Fsf_] & 0x7FFFFFFF);
 
-	if (p >= 0)
+	p = sqrt(p);
+	if (p)
 	{
-		p = sqrt(p);
-		if (p)
-		{
-			p = 1.0f / p;
-		}
+		p = 1.0f / p;
 	}
 
 	VU->p.F = p;
@@ -3886,9 +3931,16 @@ _vuRegsTables(VU1, VU1regs, FnPtr_VuRegsN)
 //  VU0macro (COP2)
 // --------------------------------------------------------------------------------------
 
+// An FMAC owns only the ZSUO cause nibble; it replaces that and ORs the
+// matching stickies in. The D/I cause pair (0x30) belongs to the div unit and
+// survives untouched -- VU_STAT_UPDATE assigns statusflag outright, so the
+// previous values have to come from VI, not from statusflag. Preserving only
+// 0xFC0 here dropped the D/I cause on every macro FMAC, against both the
+// console (VUSTICKY_FMAC_KEEPS_DI) and the arm64 recompiler, which keeps its
+// denormalized bits 18-19 across cop2EmitFlagUpdate for x86 parity.
 static __fi void SYNCMSFLAGS()
 {
-	VU0.VI[REG_STATUS_FLAG].UL = (VU0.VI[REG_STATUS_FLAG].UL & 0xFC0) | (VU0.statusflag & 0xF) | ((VU0.statusflag & 0xF) << 6);
+	VU0.VI[REG_STATUS_FLAG].UL = (VU0.VI[REG_STATUS_FLAG].UL & 0xFF0) | (VU0.statusflag & 0xF) | ((VU0.statusflag & 0xF) << 6);
 	VU0.VI[REG_MAC_FLAG].UL = VU0.macflag;
 }
 
@@ -3902,10 +3954,15 @@ static __fi void SYNCSTATUSFLAG()
 	VU0.VI[REG_STATUS_FLAG].UL = (VU0.VI[REG_STATUS_FLAG].UL & 0xFC0) | (VU0.statusflag & 0xF) | ((VU0.statusflag & 0xF) << 6);
 }
 
+// A div-unit op REPLACES the D/I cause pair -- a clean divide clears it -- but
+// the stickies only ever grow. Preserving only 0x3CF cleared sticky IS/DS
+// (0xC00) and then re-derived them from the current cause, so sticky D/I could
+// never accumulate across two div ops (VUSTICKY_DI_ACCUMULATE_SQRT_DIV) nor
+// outlive a clean one (VUSTICKY_CLEAN_DIV_KEEPS_STICKY_DI).
 static __fi void SYNCFDIV()
 {
 	VU0.VI[REG_Q].UL = VU0.q.UL;
-	VU0.VI[REG_STATUS_FLAG].UL = (VU0.VI[REG_STATUS_FLAG].UL & 0x3CF) | (VU0.statusflag & 0x30) | ((VU0.statusflag & 0x30) << 6);
+	VU0.VI[REG_STATUS_FLAG].UL = (VU0.VI[REG_STATUS_FLAG].UL & 0xFCF) | (VU0.statusflag & 0x30) | ((VU0.statusflag & 0x30) << 6);
 }
 
 void VABS()  { VU0.code = cpuRegs.code; _vuABS(&VU0); }

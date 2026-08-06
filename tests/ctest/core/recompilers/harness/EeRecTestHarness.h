@@ -69,6 +69,27 @@ public:
 	void EnableFpuFullMode();
 	void EnableFpuMulHack();
 
+	// Turns ON the (default-OFF) fpuExtraOverflow Recompiler option — GameDB
+	// eeClampMode >= 2, CHECK_FPU_EXTRA_OVERFLOW — so the JIT clamps each fpr
+	// SOURCE operand to ±fMax before the op, the way the interpreter's
+	// fpuDouble always does. The interpreter has no equivalent switch, so this
+	// is the clamp mode in which the two engines see the same operands.
+	// Restored to its previous value in the dtor.
+	void EnableFpuExtraOverflow();
+
+	// Turns OFF the (default-ON) fpuOverflow Recompiler option — GameDB
+	// eeClampMode 0, CHECK_FPU_OVERFLOW.
+	//
+	// On arm64 this currently changes NO emitted code: the three paths that used
+	// to gate on the lower threshold (SQRT.S's operand clamp, MAX.S/MIN.S's
+	// operands, ABS.S's result on x86) have each been shown against the console
+	// to be wrong in every mode and removed. It is still live in the x86
+	// recompiler and still set from the GameDB, so the switch stays; see the
+	// retired liveness witness at the foot of ee_fpu_absneg_clamp_tests.cpp
+	// before relying on a clamp0 leg to distinguish anything. The interpreter
+	// has no equivalent switch. Restored in the dtor.
+	void DisableFpuOverflow();
+
 	// Turns OFF the (default-ON) fpuGuardedAddSub Recompiler option so the JIT
 	// emits a plain single-precision add/sub with no guard-bit masking — the
 	// opt-out perf path. Off makes the JIT bit-identical to the single-precision
@@ -364,6 +385,10 @@ private:
 	bool prev_fpu_mul_hack_ = false;
 	bool fpu_guarded_changed_ = false;
 	bool prev_fpu_guarded_ = false;
+	bool fpu_extra_overflow_changed_ = false;
+	bool prev_fpu_extra_overflow_ = false;
+	bool fpu_overflow_changed_ = false;
+	bool prev_fpu_overflow_ = false;
 };
 
 } // namespace recompiler_tests

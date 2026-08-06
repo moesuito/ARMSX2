@@ -46,6 +46,8 @@ struct GraphicsSettingsView: View {
             }
             if status.pinned {
                 Button(settings.localized("Use the game database value")) {
+                    // Reset first; the value write may pin again, so the unpin must come last.
+                    settings.resetGraphicsHackValue(key)
                     settings.setGraphicsHackPinned(key, false)
                 }
                 .font(.caption)
@@ -109,16 +111,14 @@ struct GraphicsSettingsView: View {
             } header: {
                 Text(settings.localized("Performance"))
             } footer: {
-                Text(settings.localized("Pipelined splits GS emulation across two threads on multi-core systems and competes for cores with EE/VU threads. The debug modes are much slower — do not use them for play."))
+                Text(settings.localized("Pipelined splits GS emulation across two threads on multi-core systems and competes for cores with EE/VU threads. The debug modes are much slower — do not use them for play. Requires restart."))
             }
 
             Section(settings.localized("Renderer")) {
                 Picker(settings.localized("Renderer"), selection: $settings.renderer) {
-                    Text(settings.localized("Metal (Hardware)")).tag(17)
-#if !targetEnvironment(macCatalyst)
-                    Text(settings.localized("Software")).tag(13)
-                    Text(settings.localized("Null (No Output)")).tag(11)
-#endif
+                    ForEach(SettingsOptions.renderer, id: \.id) { option in
+                        Text(settings.localized(option.title)).tag(option.id)
+                    }
                 }
                 .disabled(gameIsLoaded)
                 if gameIsLoaded {
@@ -155,16 +155,9 @@ struct GraphicsSettingsView: View {
 
             Section(settings.localized("Upscaling")) {
                 Picker(settings.localized("Internal Resolution"), selection: $settings.upscaleMultiplier) {
-                    Text(settings.localized("0.25x (Fastest)")).tag(Float(0.25))
-                    Text("0.5x").tag(Float(0.5))
-                    Text("0.75x").tag(Float(0.75))
-                    Text(settings.localized("1x Native (512x448)")).tag(Float(1.0))
-                    Text("2x (1024x896)").tag(Float(2.0))
-                    Text("3x (1536x1344)").tag(Float(3.0))
-                    Text("4x (2048x1792)").tag(Float(4.0))
-                    Text("5x (2560x2240)").tag(Float(5.0))
-                    Text("6x (3072x2688)").tag(Float(6.0))
-                    Text("8x (4096x3584)").tag(Float(8.0))
+                    ForEach(UpscaleOptions.all, id: \.id) { option in
+                        Text(settings.localized(option.title)).tag(option.id)
+                    }
                 }
                 Text(settings.localized("Lower values can help performance on heavy games. Higher values improve visual quality but reduce performance significantly. Applies immediately; the renderer may briefly stutter while it reinits."))
                     .font(.caption)
@@ -215,18 +208,7 @@ struct GraphicsSettingsView: View {
                     set: { settings.casMode = $0 ? 1 : 0 }
                 ))
                 if settings.casMode > 0 {
-                    HStack {
-                        Text(settings.localized("Sharpness"))
-                        Slider(value: Binding(
-                            get: { Float(settings.casSharpness) / 100.0 },
-                            set: { settings.casSharpness = Int($0 * 100) }
-                        ), in: 0...1, onEditingChanged: { editing in
-                            if editing { settings.beginVisualSliderEdit() } else { settings.endVisualSliderEdit() }
-                        })
-                        Text("\(settings.casSharpness)%")
-                            .font(.caption)
-                            .frame(width: 40)
-                    }
+                    NumberRow(.casSharpness, value: $settings.casSharpness, settings: settings)
                 }
                 Text(settings.localized("Contrast Adaptive Sharpening via Metal. Sharpens the image after rendering."))
                     .font(.caption)
@@ -245,14 +227,17 @@ struct GraphicsSettingsView: View {
                     .foregroundStyle(.secondary)
 
                 Picker(settings.localized("Deinterlace"), selection: $settings.interlaceMode) {
-                    Text(settings.localized("None")).tag(0)
-                    Text(settings.localized("Weave (TFF)")).tag(1)
-                    Text(settings.localized("Weave (BFF)")).tag(2)
-                    Text(settings.localized("Bob (TFF)")).tag(3)
-                    Text(settings.localized("Bob (BFF)")).tag(4)
-                    Text(settings.localized("Blend (TFF)")).tag(5)
-                    Text(settings.localized("Blend (BFF)")).tag(6)
-                    Text(settings.localized("Adaptive (Default)")).tag(7)
+                    // Tags are GSInterlaceMode values; a shift by one renames every mode.
+                    Text(settings.localized("Automatic (Default)")).tag(0)
+                    Text(settings.localized("Off (No Deinterlacing)")).tag(1)
+                    Text(settings.localized("Weave (TFF)")).tag(2)
+                    Text(settings.localized("Weave (BFF)")).tag(3)
+                    Text(settings.localized("Bob (TFF)")).tag(4)
+                    Text(settings.localized("Bob (BFF)")).tag(5)
+                    Text(settings.localized("Blend (TFF)")).tag(6)
+                    Text(settings.localized("Blend (BFF)")).tag(7)
+                    Text(settings.localized("Adaptive (TFF)")).tag(8)
+                    Text(settings.localized("Adaptive (BFF)")).tag(9)
                 }
 
                 Picker(settings.localized("Aspect Ratio"), selection: $settings.aspectRatio) {
@@ -300,10 +285,14 @@ struct GraphicsSettingsView: View {
             Section {
                 Toggle(settings.localized("Shade Boost"), isOn: $settings.shadeBoost)
                 if settings.shadeBoost {
-                    percentSlider("Brightness", value: $settings.shadeBoostBrightness)
-                    percentSlider("Contrast", value: $settings.shadeBoostContrast)
-                    percentSlider("Saturation", value: $settings.shadeBoostSaturation)
-                    percentSlider("Gamma", value: $settings.shadeBoostGamma)
+                    NumberRow(.shadeBoostBrightness, value: $settings.shadeBoostBrightness,
+                              settings: settings)
+                    NumberRow(.shadeBoostContrast, value: $settings.shadeBoostContrast,
+                              settings: settings)
+                    NumberRow(.shadeBoostSaturation, value: $settings.shadeBoostSaturation,
+                              settings: settings)
+                    NumberRow(.shadeBoostGamma, value: $settings.shadeBoostGamma,
+                              settings: settings)
                 }
             } header: {
                 Text(settings.localized("Shade Boost"))
@@ -366,14 +355,20 @@ struct GraphicsSettingsView: View {
                 Toggle(settings.localized("Wild Arms Offset"), isOn: claiming("UserHacks_ForceEvenSpritePosition", $settings.wildArmsOffset))
                 hackNote("UserHacks_ForceEvenSpritePosition", shown: settings.wildArmsOffset ? 1 : 0)
 
-                ClampedIntField(title: settings.localized("Texture Offset X"), value: claiming("UserHacks_TCOffsetX", $settings.textureOffsetX), range: SettingsStore.textureOffsetRange)
-                ClampedIntField(title: settings.localized("Texture Offset Y"), value: claiming("UserHacks_TCOffsetY", $settings.textureOffsetY), range: SettingsStore.textureOffsetRange)
+                NumberRow(.textureOffsetX,
+                          value: claiming("UserHacks_TCOffsetX", $settings.textureOffsetX),
+                          settings: settings)
+                NumberRow(.textureOffsetY,
+                          value: claiming("UserHacks_TCOffsetY", $settings.textureOffsetY),
+                          settings: settings)
                 Text(settings.localized("Texture offsets are advanced troubleshooting values. Type a value and clamp to range. Default is 0."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                ClampedIntField(title: settings.localized("Skipdraw Start"), value: skipDrawStartBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacks)
-                ClampedIntField(title: settings.localized("Skipdraw End"), value: skipDrawEndBinding, range: SettingsStore.skipDrawRange, isEnabled: manualAdvancedHacks)
+                NumberRow(.skipDrawStart, value: skipDrawStartBinding, settings: settings)
+                    .disabled(!manualAdvancedHacks)
+                NumberRow(.skipDrawEnd, value: skipDrawEndBinding, settings: settings)
+                    .disabled(!manualAdvancedHacks)
                 Text(settings.localized("For Skipdraw 1, use Start 1 and End 1. Applies immediately."))
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -385,41 +380,35 @@ struct GraphicsSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                intPicker("Texture Inside RT", selection: $settings.textureInsideRt, options: [
-                    ("Off", 0), ("Inside Targets", 1), ("Merge Targets", 2)
-                ])
+                intPicker("Texture Inside RT", selection: claiming("UserHacks_TextureInsideRt", $settings.textureInsideRt), shared: SettingsOptions.textureInsideRT)
+                hackNote("UserHacks_TextureInsideRt", shown: settings.textureInsideRt)
                 intPicker("Limit 24-Bit Depth", selection: $settings.limit24BitDepth, options: [
                     ("Off", 0), ("Prioritise Upper Bits", 1), ("Prioritise Lower Bits", 2)
                 ])
-                intPicker("Native Scaling", selection: $settings.nativeScaling, options: [
+                intPicker("Native Scaling", selection: claiming("UserHacks_native_scaling", $settings.nativeScaling), options: [
                     ("Off", 0), ("Normal", 1), ("Aggressive", 2), ("Normal (Maintain Upscale)", 3), ("Aggressive (Maintain Upscale)", 4)
                 ])
-                intPicker("CPU CLUT Render", selection: $settings.cpuClutRender, options: [
-                    ("Disabled", 0), ("Normal", 1), ("Aggressive", 2)
-                ])
-                intPicker("GPU Target CLUT", selection: $settings.gpuTargetClut, options: [
-                    ("Off", 0), ("Enabled (Exact Match)", 1), ("Enabled (Inside Target)", 2)
-                ])
-                intPicker("Bilinear Upscale", selection: $settings.bilinearUpscaleHack, options: [
+                hackNote("UserHacks_native_scaling", shown: settings.nativeScaling)
+                intPicker("CPU CLUT Render", selection: $settings.cpuClutRender, shared: SettingsOptions.cpuClutRender)
+                intPicker("GPU Target CLUT", selection: $settings.gpuTargetClut, shared: SettingsOptions.gpuTargetClut)
+                intPicker("Bilinear Upscale", selection: claiming("UserHacks_BilinearHack", $settings.bilinearUpscaleHack), options: [
                     ("Automatic", 0), ("Force Bilinear", 1), ("Force Nearest", 2)
                 ])
-                ClampedIntField(title: settings.localized("CPU Sprite Render BW"), value: $settings.cpuSpriteRenderBw, range: 0...10)
-                ClampedIntField(title: settings.localized("CPU Sprite Render Level"), value: $settings.cpuSpriteRenderLevel, range: 0...2)
-                intPicker("Max Anisotropy", selection: $settings.maxAnisotropy, options: [
-                    ("Off", 0), ("2x", 2), ("4x", 4), ("8x", 8), ("16x", 16)
-                ])
-                intPicker("Hardware Download Mode", selection: $settings.hardwareDownloadMode, options: [
-                    ("Enabled", 0), ("Force Full", 1), ("No Readbacks", 2), ("Unsynchronized", 3), ("Disabled", 4)
-                ])
-                intPicker("TV/CRT Shader", selection: $settings.tvShader, options: [
-                    ("Off", 0), ("Scanline", 1), ("Diagonal", 2), ("Tri", 3), ("Wave", 4), ("Lottes", 5), ("4xRGSS", 6), ("NxAGSS", 7)
-                ])
+                hackNote("UserHacks_BilinearHack", shown: settings.bilinearUpscaleHack)
+                NumberRow(.cpuSpriteRenderBw, value: $settings.cpuSpriteRenderBw,
+                          settings: settings)
+                intPicker("CPU Sprite Render Level", selection: $settings.cpuSpriteRenderLevel,
+                          shared: SettingsOptions.cpuSpriteRenderLevel)
+                intPicker("Max Anisotropy", selection: $settings.maxAnisotropy, shared: SettingsOptions.maxAnisotropy)
+                intPicker("Hardware Download Mode", selection: $settings.hardwareDownloadMode, shared: SettingsOptions.hardwareDownloadMode)
+                intPicker("TV/CRT Shader", selection: $settings.tvShader, shared: SettingsOptions.tvShader)
 
                 ForEach(SettingsStore.gsBoolHackOptions) { option in
                     Toggle(settings.localized(option.label), isOn: Binding(
                         get: { settings.gsBoolHackEnabled(option.key) },
                         set: { settings.setGSBoolHack(option.key, $0) }
                     ))
+                    hackNote(option.key, shown: settings.gsBoolHackEnabled(option.key) ? 1 : 0)
                 }
             } header: {
                 Text(settings.localized("Hardware Fixes"))
@@ -551,60 +540,8 @@ struct GraphicsSettingsView: View {
         }
     }
 
-    /// Labeled 1–100 percent slider used by Shade Boost.
-    @ViewBuilder
-    private func percentSlider(_ title: String, value: Binding<Int>) -> some View {
-        HStack {
-            Text(settings.localized(title))
-            Slider(value: Binding(
-                get: { Double(value.wrappedValue) },
-                set: { value.wrappedValue = Int($0.rounded()) }
-            ), in: 1...100, onEditingChanged: { editing in
-                if editing { settings.beginVisualSliderEdit() } else { settings.endVisualSliderEdit() }
-            })
-            Text("\(value.wrappedValue)%")
-                .font(.caption.monospacedDigit())
-                .frame(width: 44, alignment: .trailing)
-        }
-    }
-}
-
-/// A typeable integer field for advanced/manual hack values. Text is committed when
-/// editing ends: valid input is clamped to `range`, and invalid input reverts to the
-/// last good value so a bad string can never be written or crash the field.
-struct ClampedIntField: View {
-    let title: String
-    @Binding var value: Int
-    let range: ClosedRange<Int>
-    var isEnabled: Bool = true
-
-    @State private var text: String = ""
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        HStack {
-            Text(title)
-            Spacer()
-            TextField("0", text: $text)
-                .keyboardType(.numbersAndPunctuation)
-                .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 110)
-                .focused($focused)
-                .disabled(!isEnabled)
-        }
-        .onAppear { text = String(value) }
-        .onChange(of: value) { _, newValue in
-            if !focused { text = String(newValue) }
-        }
-        .onChange(of: focused) { _, isFocused in
-            if !isFocused { commit() }
-        }
-    }
-
-    private func commit() {
-        if let parsed = Int(text.trimmingCharacters(in: .whitespaces)) {
-            value = min(max(parsed, range.lowerBound), range.upperBound)
-        }
-        text = String(value)
+    /// Same picker over a shared `SettingsOptions` list, which the per-game tabs read too.
+    private func intPicker(_ title: String, selection: Binding<Int>, shared: [(id: Int, title: String)]) -> some View {
+        intPicker(title, selection: selection, options: shared.map { ($0.title, $0.id) })
     }
 }

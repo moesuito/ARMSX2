@@ -651,6 +651,9 @@ const char* Pcsx2Config::GSOptions::AspectRatioNames[(size_t)AspectRatioType::Ma
 	"16:9",
 	"10:7",
 	"21:9",
+	"20:9",
+	"19.5:9",
+	"Custom",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectRatioSwitchType::MaxCount + 1] = {
@@ -660,6 +663,9 @@ const char* Pcsx2Config::GSOptions::FMVAspectRatioSwitchNames[(size_t)FMVAspectR
 	"16:9",
 	"10:7",
 	"21:9",
+	"20:9",
+	"19.5:9",
+	"Custom",
 	nullptr};
 
 const char* Pcsx2Config::GSOptions::DisplayRotationNames[(size_t)DisplayRotation::MaxCount + 1] = {
@@ -841,6 +847,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(LinearPresent) &&
 
 		OpEqu(StretchY) &&
+		OpEqu(CustomAspectRatio) &&
 		OpEqu(Crop[0]) &&
 		OpEqu(Crop[1]) &&
 		OpEqu(Crop[2]) &&
@@ -984,11 +991,6 @@ bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) cons
 		   OpEqu(EnableAdrenoFramebufferFetch) &&
 		   OpEqu(ForceMaliFramebufferFetch) &&
 		   OpEqu(OverrideTextureBarriers) &&
-		   // Drivers carrying UseRenderTargetCopyForFeedback only take the RT-copy path when
-		   // replacements are loaded (see GSDeviceVK::CheckFeatures), and that decision picks the
-		   // tfx.glsl RT-read variant at shader-compile time. Toggling this in place would leave
-		   // m_features.texture_barrier and every compiled pipeline disagreeing with the setting.
-		   OpEqu(LoadTextureReplacements) &&
 		   OpEqu(DepthFeedbackMode) &&
 		   OpEqu(BackThreadMode) &&
 		   OpEqu(HWAA1) &&
@@ -1021,6 +1023,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBoolEx(OrganizeSnapshotsByGame, "OrganizeScreenshotsByGame");
 	SettingsWrapBitBoolEx(OrganizeVideoCaptureByGame, "OrganizeVideoCaptureByGame");
 	SettingsWrapEntry(StretchY);
+	SettingsWrapEntry(CustomAspectRatio);
 	SettingsWrapEntryEx(Crop[0], "CropLeft");
 	SettingsWrapEntryEx(Crop[1], "CropTop");
 	SettingsWrapEntryEx(Crop[2], "CropRight");
@@ -1256,12 +1259,14 @@ void Pcsx2Config::GSOptions::MaskUserHacks(bool respect_claims)
 		UserHacks_TCOffsetX = 0;
 	if (!keep(GSUserHackOverride::TextureOffsetY))
 		UserHacks_TCOffsetY = 0;
+	if (!keep(GSUserHackOverride::PreloadFrameData))
+		PreloadFrameWithGSData = false;
+	if (!keep(GSUserHackOverride::DisablePartialInvalidation))
+		UserHacks_DisablePartialInvalidation = false;
 
 	UserHacks_DisableSafeFeatures = false;
 	UserHacks_DisableRenderFixes = false;
 	GPUPaletteConversion = false;
-	PreloadFrameWithGSData = false;
-	UserHacks_DisablePartialInvalidation = false;
 	UserHacks_DisableDepthSupport = false;
 	UserHacks_CPUFBConversion = false;
 	UserHacks_ReadTCOnClose = false;
@@ -1285,6 +1290,38 @@ void Pcsx2Config::GSOptions::MaskUpscalingHacks()
 	// (GSRendererHW::Draw wants rt->GetScale() > 1), so honouring a pin would only leave
 	// GSConfig and the settings overlay claiming something that never runs.
 
+	// Say what gets turned off. The GameDB apply has already announced several of these as
+	// "Enabled GS Hardware Fix", and until this line existed nothing ever contradicted it --
+	// so a log read at face value overstated what was in force, and did exactly that during
+	// the Rogue Galaxy work. Naming only the fixes that were really on keeps repeat calls
+	// quiet too: after the first pass there is nothing left to clear, so a settings re-apply
+	// adds no noise. Fix names match the GameDB ones so the two lines can be read together.
+	std::string cleared;
+	const auto note = [&cleared](const char* name) {
+		fmt::format_to(std::back_inserter(cleared), "{}{}", cleared.empty() ? "" : ", ", name);
+	};
+
+	if (UserHacks_AlignSpriteX)
+		note("alignSprite");
+	if (UserHacks_MergePPSprite)
+		note("mergeSprite");
+	if (UserHacks_ForceEvenSpritePosition)
+		note("forceEvenSpritePosition");
+	if (UserHacks_BilinearHack != GSBilinearDirtyMode::Automatic)
+		note("bilinearUpscale");
+	if (UserHacks_NativePaletteDraw)
+		note("nativePaletteDraw");
+	if (UserHacks_HalfPixelOffset != GSHalfPixelOffset::Off)
+		note("halfPixelOffset");
+	if (UserHacks_RoundSprite != 0)
+		note("roundSprite");
+	if (UserHacks_NativeScaling != GSNativeScaling::Off)
+		note("nativeScaling");
+	if (UserHacks_TCOffsetX != 0)
+		note("textureOffsetX");
+	if (UserHacks_TCOffsetY != 0)
+		note("textureOffsetY");
+
 	UserHacks_AlignSpriteX = false;
 	UserHacks_MergePPSprite = false;
 	UserHacks_ForceEvenSpritePosition = false;
@@ -1295,6 +1332,9 @@ void Pcsx2Config::GSOptions::MaskUpscalingHacks()
 	UserHacks_NativeScaling = GSNativeScaling::Off;
 	UserHacks_TCOffsetX = 0;
 	UserHacks_TCOffsetY = 0;
+
+	if (!cleared.empty())
+		Console.WriteLn("GS: Native resolution, so these upscaling-only fixes do not apply and were turned off: %s", cleared.c_str());
 }
 
 bool Pcsx2Config::GSOptions::UseHardwareRenderer() const

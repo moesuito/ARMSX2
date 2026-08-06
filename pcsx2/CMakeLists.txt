@@ -96,6 +96,7 @@ set(pcsx2Sources
 	MMI.cpp
 	MTGS.cpp
 	MTVU.cpp
+	no-jit-improvements.cpp
 	Patch.cpp
 	Pcsx2Config.cpp
 	PerformanceMetrics.cpp
@@ -107,6 +108,7 @@ set(pcsx2Sources
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
 	SaveState.cpp
+	SaveStateLegacy.cpp
 	ShiftJisToUnicode.cpp
 	Sif.cpp
 	Sif0.cpp
@@ -181,6 +183,7 @@ set(pcsx2Headers
 	MTVU.h
 	Memory.h
 	MemoryTypes.h
+	no-jit-improvements.h
 	Patch.h
 	PerformanceMetrics.h
 	PrecompiledHeader.h
@@ -188,6 +191,7 @@ set(pcsx2Headers
 	R5900.h
 	R5900OpcodeTables.h
 	SaveState.h
+	SaveStateLegacy.h
 	ShaderCacheVersion.h
 	Sifcmd.h
 	Sif.h
@@ -264,6 +268,7 @@ set(pcsx2SPU2Sources
 	SPU2/RegTable.cpp
 	SPU2/Reverb.cpp
 	SPU2/spu2freeze.cpp
+	SPU2/spu2freeze-legacy.cpp
 	SPU2/spu2sys.cpp
 	SPU2/Wavedump_wav.cpp
 )
@@ -582,7 +587,9 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSFunctionMap.h
 	GS/Renderers/Common/GSGPUProfile.h
 	GS/Renderers/Common/GSGPUProfilePrivate.h
+	GS/Renderers/Common/GSInterlaceModePolicy.h
 	GS/Renderers/Common/GSPassScheduler.h
+	GS/Renderers/Common/GSPresentationPolicy.h
 	GS/Renderers/Common/GSRenderer.h
 	GS/Renderers/Common/GSShaderEnums.h
 	GS/Renderers/Common/GSTexture.h

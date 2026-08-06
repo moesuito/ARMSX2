@@ -42,7 +42,11 @@ public:
 	// front parser object of the two-object split passes the back object's
 	// channel so its records land in the consumed ring. Default (nullptr) uses
 	// this object's own channel storage, exactly as before.
-	GSState(GSBackQueue::Channel* shared_chan = nullptr);
+	/// `is_front_parser` suppresses the asynchronous-readback shadow allocation: the front
+	/// object of the pipelined split reaches the back's shadow through m_mem_target, so its
+	/// own copy would be written once and never read. It cannot be inferred here — the
+	/// derived constructor only repoints m_mem_target after this one returns.
+	GSState(GSBackQueue::Channel* shared_chan = nullptr, bool is_front_parser = false);
 	virtual ~GSState();
 
 	// GV7-1d-ii: channel/back-thread visibility for the front-object lifecycle
@@ -136,7 +140,7 @@ private:
 	void GIFRegHandlerTRXDIR(const GIFReg* RESTRICT r);
 	void GIFRegHandlerHWREG(const GIFReg* RESTRICT r);
 
-	template<bool auto_flush> void SetPrimHandlers();
+	template<bool auto_flush, bool sprites_only> void SetPrimHandlers();
 
 	struct GSTransferBuffer
 	{
@@ -441,7 +445,12 @@ public:
 	const GSDrawingEnvironment* m_draw_env = &m_env;
 	GSDrawingContext* m_context = nullptr;
 	GSVector4i temp_draw_rect;
+	// Owned by the renderer, which opens and closes it on the present path. The transfer
+	// and ReadFIFO packets that fill it are produced on the parse path, which is the front
+	// object under the split — hence GetDumpSink() rather than a bare m_dump read. Both
+	// paths run on the MTGS thread, so the front writes straight into the back's dump.
 	std::unique_ptr<GSDumpBase> m_dump;
+	GSDumpBase* GetDumpSink() const { return m_mem_target->m_dump.get(); }
 	bool m_scissor_invalid = false;
 	bool m_quad_check_valid = false;
 	bool m_quad_check_valid_shuffle = false;
@@ -640,6 +649,12 @@ public:
 	// itself (on a single object FlushDraw owns that aiming, and the front's
 	// carry-over rebuild depends on FlushDraw's restore happening after).
 	bool m_split_back = false;
+
+	// The inverse of m_mem_target: the object holding the authoritative parse
+	// state (env, vertex, transfer cursor). On the back renderer under the split
+	// it points at the front; everywhere else it is this. Used where the back
+	// needs the state a savestate would record — the GS dump's initial freeze.
+	GSState* m_parse_target = this;
 
 	// GV7-1c: draw-node pool. Acquire is front-side (free ring first, then arena
 	// growth up to the ring capacity, then backpressure); Release is the consume

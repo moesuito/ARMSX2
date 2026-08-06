@@ -217,12 +217,18 @@ struct EmulationOnlyGameView: View {
 
     private var retainedGameplayView: some View {
         GeometryReader { geometry in
-            let isLandscape = geometry.size.width > geometry.size.height
+            // Same screen-not-safe-region measurement as the full game screen, same reason.
+            let screen = CGSize(
+                width: geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing,
+                height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
+            )
+            let isLandscape = screen.width > screen.height
 
             Group {
                 if appState.emulationOnlyPresentation.showsVirtualControls && !isLandscape {
                     VStack(spacing: 0) {
-                        let gameHeight = min(geometry.size.width * 3 / 4, geometry.size.height * 0.6)
+                        let deckHeight = screen.height - geometry.safeAreaInsets.top
+                        let gameHeight = min(geometry.size.width * 3 / 4, deckHeight * 0.6)
                         accessibleMetalSurface
                             .frame(height: gameHeight)
                             .clipped()
@@ -234,7 +240,7 @@ struct EmulationOnlyGameView: View {
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .ignoresSafeArea(.container, edges: .bottom)
+                    .ignoresSafeArea([.container, .keyboard], edges: .bottom)
                     // Same top safe-area strip as the full game screen, same reason.
                     .background(Color.black.ignoresSafeArea())
                 } else {
@@ -328,6 +334,7 @@ struct GameScreenView: View {
     @State private var menuButtonHidden = false
     @State private var vmMenuAvailable = false
     @State private var gameMenuAvailable = false
+    @State private var noJITFallbackActive = false
     // MARK: Overlay Route
     // The pause card + every screen launched from it are driven by one FSM. Opening a child
     // transitions `.paused -> .pausedPresenting(child)` without tearing the card down; the child
@@ -350,15 +357,11 @@ struct GameScreenView: View {
     // rebuilt from scratch (fresh UIKit press surfaces) instead of diffed. This avoids
     // stale UIControl/hosting-controller state left behind by visibility edits.
     @State private var padRebuildToken = 0
-    // Polls external controllers for any button/stick activity while the menu button is
-    // hidden, so external-controller-only users are never softlocked out of pause. The
-    // poll reads GCController state snapshots only (no handlers), so it cannot steal input
-    // from SDL/core. Started when the menu is hidden during gameplay, stopped on restore.
-    @State private var menuRestorePollTimer: Timer?
-    @State private var lastControllerInputActive = false
-    // Orientation, read from the body GeometryReader. The overlay containers
-    // (pause menu, per-game settings) aren't re-measured on rotation, so we
-    // key them on this to force a fresh layout on a flip.
+    // A tap on the game view shows the hidden menu button for a moment. The
+    // setting itself only changes from the quick menu or settings.
+    @State private var menuButtonRevealed = false
+    @State private var menuRevealTask: Task<Void, Never>?
+    // Only the pause menu is keyed on this. The per-game panel holds unsaved edits.
     @State private var screenIsLandscape = true
     @State private var emulationOnlyTransitionTask: Task<Void, Never>?
     @State private var emulationOnlyActivationInFlight = false
@@ -414,6 +417,16 @@ struct GameScreenView: View {
                     onBackToMenu: {
                         appState.returnToMenu()
                     },
+                    onStop: {
+                        if settings.hapticFeedback { HapticManager.medium.impactOccurred() }
+                        overlayRoute = .hidden
+                        // Leave now rather than waiting on the shutdown notification, so nobody
+                        // watches live gameplay through the card and NVRAM flush.
+                        appState.cancelPendingBoot()
+                        appState.returnToMenu()
+                        appState.runningGameName = nil
+                        ARMSX2Bridge.requestVMStop()
+                    },
                     onResume: {
                         if settings.hapticFeedback { HapticManager.light.impactOccurred() }
                         overlayRoute = .hidden
@@ -427,7 +440,12 @@ struct GameScreenView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let isLandscape = geo.size.width > geo.size.height
+            // The window. A keyboard shrinks the safe region until iPad portrait reads wide.
+            let screen = CGSize(
+                width: geo.size.width + geo.safeAreaInsets.leading + geo.safeAreaInsets.trailing,
+                height: geo.size.height + geo.safeAreaInsets.top + geo.safeAreaInsets.bottom
+            )
+            let isLandscape = screen.width > screen.height
 
             Group {
                 if dedicatedExternalDisplayActive {
@@ -439,11 +457,12 @@ struct GameScreenView: View {
                     // Landscape: full-screen layout so pad coordinates match the layout editor.
                     ZStack {
                         MetalGameView()
-                            .onTapGesture { restoreMenuButtonIfHidden() }
+                            .onTapGesture { revealMenuButtonBriefly() }
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel("Game display")
                             .accessibilityAddTraits(.isImage)
                             .accessibilityHint("VoiceOver image recognition can read on-screen text.")
+                            .overlay { menuRevealTapCatcher }
                         AccessibilityHUDMirror()
                         if effectiveVirtualPadVisible {
                             VirtualControllerView(
@@ -465,17 +484,20 @@ struct GameScreenView: View {
                     // Game respects the top safe area so OSD stays below the Dynamic Island.
                     // Controller ignores the bottom safe area so buttons remain usable near the home indicator.
                     VStack(spacing: 0) {
-                        let gameHeight = min(geo.size.width * 3 / 4, geo.size.height * 0.6)
+                        // The deck ignores the bottom inset, so it runs to the foot of the window.
+                        let deckHeight = screen.height - geo.safeAreaInsets.top
+                        let gameHeight = min(geo.size.width * 3 / 4, deckHeight * 0.6)
                         MetalGameView()
                             .frame(height: gameHeight)
                             .clipped()
-                            .onTapGesture { restoreMenuButtonIfHidden() }
+                            .onTapGesture { revealMenuButtonBriefly() }
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel("Game display")
                             .accessibilityAddTraits(.isImage)
                             .accessibilityHint("VoiceOver image recognition can read on-screen text.")
                             .overlay {
                                 ZStack {
+                                    menuRevealTapCatcher
                                     AccessibilityHUDMirror()
                                     dynamicCrosshairOverlay
                                 }
@@ -497,31 +519,31 @@ struct GameScreenView: View {
                         }
                     }
                     .overlay(alignment: .topTrailing) {
-                        if !menuButtonHidden {
-                            menuButton()
+                        if !menuButtonHidden || menuButtonRevealed {
+                            menuButtonCluster()
                                 .padding(.top, 8)
                                 .padding(.trailing, 4)
                                 .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                         }
                     }
-                    .ignoresSafeArea(.container, edges: .bottom)
+                    // `.keyboard` too: gameplay must not move when an overlay raises one.
+                    .ignoresSafeArea([.container, .keyboard], edges: .bottom)
                     // The game stays out of the top safe area on purpose, so something has
                     // to fill it. Black rather than leaving it to whatever is behind: the
                     // root controller is only black because a boot notification made it so.
                     .background(Color.black.ignoresSafeArea())
                 }
             }
-            .preference(key: GameScreenSizePreferenceKey.self, value: geo.size)
+            .preference(key: GameScreenSizePreferenceKey.self, value: screen)
+            // Off the safe region, not the preference: the status bar moves one, not the other.
+            .onChange(of: geo.size) { _, _ in syncFullscreenStateFromWindow() }
         }
         .onPreferenceChange(GameScreenSizePreferenceKey.self) { size in
-            // The body GeometryReader is re-measured on rotation; the overlay
-            // subtrees aren't, so track orientation here and .id() the overlay
-            // containers off it to rebuild them with the new size.
+            // The window, so only a real rotation reaches this.
             let landscape = size.width > size.height
             if screenIsLandscape != landscape {
                 screenIsLandscape = landscape
             }
-            syncFullscreenStateFromWindow()
         }
         .sheet(isPresented: childPresentedBinding(.saveStates)) {
             SaveStatesPanel { message, isImportant in
@@ -567,14 +589,11 @@ struct GameScreenView: View {
         }
         .overlay {
             if case .pausedPresenting(.perGame) = overlayRoute {
-                // Presented through the same overlay shell as the pause menu so it stays
-                // integrated with gameplay (no system sheet chrome / status bar / Dynamic
-                // Island leak). The panel dismisses via Save/Cancel, so the backdrop does
-                // not tap-to-dismiss.
+                // Same shell as the pause menu, so no sheet chrome leaks over gameplay, and
+                // no `.id` unlike below: a rebuild would drop unsaved edits.
                 GameOverlayContainer(frameMode: .landscapePanel) { _ in
                     runtimePerGameSettingsContent
                 }
-                .id(screenIsLandscape)
             }
         }
         .overlay {
@@ -610,14 +629,13 @@ struct GameScreenView: View {
             refreshExternalControllerConnectionState()
             refreshRuntimeMenuState()
             consumePendingRetroAchievementsToast()
-            startMenuRestorePollingIfNeeded()
             enterEmulationOnlyModeIfReady()
         }
         .onDisappear {
             cancelEmulationOnlyTransition()
             statusBanner.cancelDismiss()
             achievementsBanner.cancelDismiss()
-            stopMenuRestorePolling()
+            cancelMenuButtonReveal()
             leaveGameplaySystemChromeMode()
         }
         // Single chokepoint for runtime pause: VM pause derives only from `overlayRoute`
@@ -626,11 +644,6 @@ struct GameScreenView: View {
         // observers that existed for the old independent booleans.
         .onChange(of: overlayRoute) { _, _ in
             updateRuntimeOverlayPause()
-            if overlayRoute != .hidden {
-                stopMenuRestorePolling()
-            } else {
-                startMenuRestorePollingIfNeeded()
-            }
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .background {
@@ -654,11 +667,7 @@ struct GameScreenView: View {
             if menuButtonHidden != isHidden {
                 menuButtonHidden = isHidden
             }
-            if isHidden {
-                startMenuRestorePollingIfNeeded()
-            } else {
-                stopMenuRestorePolling()
-            }
+            cancelMenuButtonReveal()
         }
         .onChange(of: settings.emulationOnlyModeEnabled) { _, isEnabled in
             if isEnabled {
@@ -701,6 +710,9 @@ struct GameScreenView: View {
             padRebuildToken &+= 1
             overlayRoute = .paused
         }
+        .onReceive(NotificationCenter.default.publisher(for: gameplaySurfaceTapNotification)) { _ in
+            revealMenuButtonBriefly()
+        }
         .onReceive(NotificationCenter.default.publisher(for: retroAchievementsToastNotification)) { _ in
             consumePendingRetroAchievementsToast()
         }
@@ -715,11 +727,11 @@ struct GameScreenView: View {
 
     @ViewBuilder
     private func menuButtonOverlay(isLandscape: Bool) -> some View {
-        if !menuButtonHidden {
+        if !menuButtonHidden || menuButtonRevealed {
             VStack {
                 HStack {
                     Spacer()
-                    menuButton()
+                    menuButtonCluster()
                 }
                 .padding(.top, isLandscape ? 8 : 4)
                 .padding(.trailing, isLandscape ? 8 : 4)
@@ -737,6 +749,21 @@ struct GameScreenView: View {
         }
         .accessibilityLabel(settings.localized("Pause Menu"))
         .accessibilityHint(settings.localized("Opens the pause menu"))
+    }
+
+    private func menuButtonCluster() -> some View {
+        HStack(spacing: 6) {
+            if noJITFallbackActive {
+                Text(settings.localized("No JIT"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.40), in: Capsule())
+                    .accessibilityLabel(settings.localized("No JIT mode"))
+            }
+            menuButton()
+        }
     }
 
     @MainActor
@@ -837,7 +864,7 @@ struct GameScreenView: View {
         }
         statusBanner.cancelDismiss()
         achievementsBanner.cancelDismiss()
-        stopMenuRestorePolling()
+        cancelMenuButtonReveal()
 
         runtimePerGameSettingsEntry = nil
         runtimePerGameSettings = nil
@@ -884,6 +911,14 @@ struct GameScreenView: View {
             rightRuntime: touchActionSession.right.crosshairState
         )
         .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
+    }
+
+    // The render view is non-interactive on iOS 27, so the reveal tap needs a SwiftUI surface.
+    private var menuRevealTapCatcher: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .onTapGesture { revealMenuButtonBriefly() }
+            .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -1048,82 +1083,21 @@ struct GameScreenView: View {
         }
     }
 
-    private func restoreMenuButtonIfHidden() {
+    private func revealMenuButtonBriefly() {
         guard menuButtonHidden else { return }
-
-        menuButtonHidden = false
-        settings.hideMenuButton = false
-        stopMenuRestorePolling()
-        presentStatusMessage(settings.localized("Menu button shown"))
-    }
-
-    /// Starts polling external controllers for any input while the menu button is hidden
-    /// and gameplay is active, so a hidden menu can be restored without a screen tap.
-    private func startMenuRestorePollingIfNeeded() {
-        guard menuButtonHidden, overlayRoute == .hidden, menuRestorePollTimer == nil else { return }
-        lastControllerInputActive = controllerInputActive()
-        menuRestorePollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            Task { @MainActor in
-                guard menuButtonHidden, overlayRoute == .hidden else {
-                    stopMenuRestorePolling()
-                    return
-                }
-                let active = controllerInputActive()
-                if active && !lastControllerInputActive {
-                    restoreMenuButtonIfHidden()
-                }
-                lastControllerInputActive = active
-            }
+        menuRevealTask?.cancel()
+        withAnimation(.easeOut(duration: 0.18)) { menuButtonRevealed = true }
+        menuRevealTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.18)) { menuButtonRevealed = false }
         }
     }
 
-    private func stopMenuRestorePolling() {
-        menuRestorePollTimer?.invalidate()
-        menuRestorePollTimer = nil
-        lastControllerInputActive = false
-    }
-
-    /// Reads a non-destructive snapshot of every external controller's input state. Returns
-    /// true if any face button, shoulder, trigger, d-pad direction, thumbstick, or the
-    /// menu/options/L3/R3 buttons are currently active. Setting valueChangedHandler would
-    /// conflict with SDL; reading these snapshot properties does not.
-    private func controllerInputActive() -> Bool {
-        for controller in GCController.controllers() {
-            guard let gamepad = controller.extendedGamepad else { continue }
-            if gamepad.buttonA.isPressed || gamepad.buttonB.isPressed
-                || gamepad.buttonX.isPressed || gamepad.buttonY.isPressed {
-                return true
-            }
-            if gamepad.leftShoulder.isPressed || gamepad.rightShoulder.isPressed {
-                return true
-            }
-            if gamepad.leftTrigger.value > 0.1 || gamepad.rightTrigger.value > 0.1 {
-                return true
-            }
-            let dpad = gamepad.dpad
-            if dpad.up.isPressed || dpad.down.isPressed || dpad.left.isPressed || dpad.right.isPressed {
-                return true
-            }
-            if abs(gamepad.leftThumbstick.xAxis.value) > 0.1 || abs(gamepad.leftThumbstick.yAxis.value) > 0.1 {
-                return true
-            }
-            if abs(gamepad.rightThumbstick.xAxis.value) > 0.1 || abs(gamepad.rightThumbstick.yAxis.value) > 0.1 {
-                return true
-            }
-            if gamepad.buttonMenu.isPressed {
-                return true
-            }
-            if #available(iOS 13, *), let options = gamepad.buttonOptions, options.isPressed {
-                return true
-            }
-            if #available(iOS 14, *), let l3 = gamepad.leftThumbstickButton, l3.isPressed {
-                return true
-            }
-            if #available(iOS 14, *), let r3 = gamepad.rightThumbstickButton, r3.isPressed {
-                return true
-            }
-        }
-        return false
+    private func cancelMenuButtonReveal() {
+        menuRevealTask?.cancel()
+        menuRevealTask = nil
+        menuButtonRevealed = false
     }
 
     private func updateRuntimeOverlayPause() {
@@ -1177,11 +1151,15 @@ struct GameScreenView: View {
     private func refreshRuntimeMenuState() {
         let vmRunning = ARMSX2Bridge.isVMRunning()
         let gameReady = ARMSX2Bridge.hasValidSaveStateGame()
+        let noJITActive = ARMSX2Bridge.isNoJITFallbackActive()
         if vmMenuAvailable != vmRunning {
             vmMenuAvailable = vmRunning
         }
         if gameMenuAvailable != gameReady {
             gameMenuAvailable = gameReady
+        }
+        if noJITFallbackActive != noJITActive {
+            noJITFallbackActive = noJITActive
         }
         let identity = gameReady ? runtimePadLayoutIdentityForCurrentGame() : nil
         if runtimePadLayoutIdentity != identity {
@@ -2010,29 +1988,8 @@ private struct SpeedControlPanel: View {
                         }
                     ))
 
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text(settings.localized("Fast Forward Speed"))
-                            Spacer()
-                            Text(Self.formatPercent(settings.fastForwardScalar))
-                                .foregroundStyle(.secondary)
-                                .font(.callout.monospacedDigit())
-                        }
-
-                        Slider(
-                            value: $settings.fastForwardScalar,
-                            in: SettingsStore.minFastForwardScalar...SettingsStore.maxFastForwardScalar,
-                            step: 0.25
-                        )
-
-                        HStack {
-                            quickFastForwardButton(1.5)
-                            quickFastForwardButton(2.0)
-                            quickFastForwardButton(3.0)
-                            quickFastForwardButton(5.0)
-                            quickFastForwardButton(10.0)
-                        }
-                    }
+                    NumberRow(.fastForwardSpeed, value: $settings.fastForwardScalar,
+                              settings: settings)
                 }
 
                 if hardcoreActive {
@@ -2044,14 +2001,15 @@ private struct SpeedControlPanel: View {
                 }
 
                 Section(settings.localized("How It Works")) {
-                    Text(settings.localized("This controls PCSX2 Normal Speed. On NTSC games, 60 FPS is normal speed and 30 FPS is about 50% speed. It is safe to change while a game is running."))
+                    Text(settings.localized("The FPS Target changes display presentation without slowing CPU, audio, or game timing. Fast Forward remains a separate emulation-speed control."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
                     HStack {
                         Text(settings.localized("Normal Speed"))
                         Spacer()
-                        Text(Self.formatPercent(settings.targetFPS / max(settings.ntscFramerate, 1.0)))
+                        Text(Self.formatPercent(SettingsStore.normalSpeedScalar(
+                            frameLimiterEnabled: settings.frameLimiterEnabled)))
                             .foregroundStyle(.secondary)
                             .font(.callout.monospacedDigit())
                     }
@@ -2077,23 +2035,6 @@ private struct SpeedControlPanel: View {
     private func refreshRuntimeState() {
         settings.fastForwardRuntimeEnabled = ARMSX2Bridge.limiterMode() == 1
         hardcoreActive = ARMSX2Bridge.isRetroAchievementsHardcoreActive()
-        enforceHardcoreSpeedFloorIfNeeded()
-    }
-
-    private func enforceHardcoreSpeedFloorIfNeeded() {
-        guard hardcoreActive else { return }
-        let minimumFPS = settings.ntscFramerate
-        if settings.frameLimiterEnabled && settings.targetFPS < minimumFPS {
-            settings.targetFPS = minimumFPS
-        }
-    }
-
-    private func quickFastForwardButton(_ scalar: Float) -> some View {
-        Button(Self.formatPercent(scalar)) {
-            settings.fastForwardScalar = scalar
-        }
-        .buttonStyle(.bordered)
-        .font(.caption.monospacedDigit())
     }
 
     private static func formatPercent(_ scalar: Float) -> String {

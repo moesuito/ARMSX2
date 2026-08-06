@@ -3,6 +3,7 @@
 
 #include "Common.h"
 
+#include <cfloat>
 #include <cmath>
 
 // Helper Macros
@@ -182,6 +183,101 @@ float fpuDouble(u32 f)
 	}
 }
 
+/*	The EE multiplier's one-ULP deficit.
+
+	The console's multiply array is not a correctly-rounding multiplier: it
+	comes back exactly one step closer to zero on a large fraction of operands,
+	and which operands depends on operand order. Upstream states the rule in a
+	comment (pcsx2/x86/iFPU.cpp:500) and never tests it; FpuMulHack is a
+	one-point sample of it.
+
+	Measured on SCPH-90000 (FCR0 0x2e40), captures/fpmul/, 25M probes:
+
+	  * mul.s(1.0, x) was measured for every one of the 2^23 significands.
+	    8257536 come back one ULP low and 131072 exact -- and nothing ever came
+	    back high, or two ULP low, in 16.8M probes.
+	  * mul.s(x, 1.0) is exact for all 2^23. The asymmetry is total, not
+	    statistical: the predicate reads ft and never fs, which is exactly why
+	    the operation is not commutative.
+	  * Unchanged across twelve exponent-field pairs from (1,254) to (254,1),
+	    so it is a significand-domain effect with no exponent term.
+
+	Bits 1,3,5,7,9 of ft's mantissa are the sign bits of the five lowest
+	radix-4 Booth digits, which is what identifies the mechanism: ft is the
+	recoded operand and the array's low columns are not built, so each low
+	negative digit's two's-complement correction is dropped. The bit-11 term is
+	a boundary effect at the truncation column; it is written as measured, not
+	derived.
+
+	What this does not model: the deficit is smaller than one ULP -- at most
+	~27308 against an ULP of 2^23 -- so it only reaches the result when the
+	exact product has nothing below the ULP to absorb it. That is the tail test
+	below, and it is the whole of the modelled class. When the tail is non-zero
+	the console is one ULP low iff the tail is smaller than the deficit, and the
+	deficit is not identifiable from mul.s observations: the instruction only
+	ever exposes the one comparison it performs. That residual is ~0.1% of
+	random operand pairs.
+*/
+static bool eeMulDefectiveFt(u32 ft)
+{
+	const u32 m = ft & 0x7FFFFF;
+	if (m & 0x2AA) // a negative Booth digit among 0..4
+		return true;
+	const u32 h = (m >> 12) & 0xF;
+	return ((m >> 11) & 1u) != ((h >= 8 && h <= 13) ? 1u : 0u);
+}
+
+static bool eeMulOneUlpLow(u32 fs, u32 ft)
+{
+	if ((fs & 0x7F800000) == 0 || (ft & 0x7F800000) == 0)
+		return false; // a zero operand (denormals are zero): the product is zero
+
+	const u64 a = 0x800000u | (fs & 0x7FFFFF);
+	const u64 b = 0x800000u | (ft & 0x7FFFFF);
+	const u64 prod = a * b; // 47 or 48 significant bits, exact in 64
+	const int k = (prod >> 47) ? 24 : 23;
+	if (prod & ((1ull << k) - 1u))
+		return false; // the tail below the ULP absorbs the deficit
+
+	return eeMulDefectiveFt(ft);
+}
+
+/*	fpuDouble() both operands, multiply, apply the deficit.
+
+	The predicate is fed the operands as multiplied, not the guest registers:
+	fpuDouble() clamps an exponent-0xff operand down to +/-Fmax, and that
+	changes ft's mantissa. (Clamping there is a separate and known gap against
+	silicon, which treats exponent 0xff as an ordinary binade; this models the
+	multiplier on top of whatever fpuDouble hands it, rather than smuggling in a
+	second change.)
+
+	Applied only where it was measured. A saturating result, a flushed one, and
+	a decrement that would walk the exponent field out of the normals are all
+	left alone.
+*/
+static u32 eeMulProduct(u32 fs, u32 ft)
+{
+	FPRreg s, t, p;
+	s.f = fpuDouble( fs );
+	t.f = fpuDouble( ft );
+	p.f = s.f * t.f;
+
+	// A saturated result is not a rounded one. Testing p.f for an infinity is
+	// not enough: under round-toward-zero an overflowing product comes back as
+	// Fmax, so checkOverflow() never sees it and the bit pattern is
+	// indistinguishable from a product that genuinely landed on Fmax -- which
+	// silicon does decrement (1.0 * FLT_MAX -> 0x7F7FFFFE). float x float is
+	// exact in double, so ask the exact product instead.
+	if (!(std::fabs( static_cast<double>(s.f) * static_cast<double>(t.f) ) <= FLT_MAX))
+		return p.UL;
+	if ((p.UL & 0x7F800000) == 0) // flushed, zero, or a denormal on its way out
+		return p.UL;
+	if ((p.UL & 0x7FFFFFFF) == 0x00800000) // a decrement would leave the normals
+		return p.UL;
+
+	return eeMulOneUlpLow( s.UL, t.UL ) ? p.UL - 1u : p.UL;
+}
+
 void ABS_S() {
 	_FdValUl_ = _FsValUl_ & 0x7fffffff;
 	clearFPUFlags( FPUflagO | FPUflagU );
@@ -234,12 +330,13 @@ void C_LT() {
 void CFC1() {
 	if (!_Rt_) return;
 
-	if (_Fs_ == 31)
-		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)fpuRegs.fprc[31];	// force sign extension to 64 bit
-	else if (_Fs_ == 0)
-		cpuRegs.GPR.r[_Rt_].SD[0] = 0x2E00;
+	// Only bit 4 of the register field is decoded: 0-15 alias FCR0, 16-31
+	// alias FCR31. Both recompilers implement this (iFPU.cpp recCFC1,
+	// iFPU-arm64.cpp recCFC1); the SD[0] stores force sign extension to 64 bit.
+	if (_Fs_ >= 16)
+		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)((fpuRegs.fprc[31] & 0x0083c078) | 0x01000001); // drop always-zero bits, set always-one bits
 	else
-		cpuRegs.GPR.r[_Rt_].SD[0] = 0;
+		cpuRegs.GPR.r[_Rt_].SD[0] = (s32)fpuRegs.fprc[0];
 }
 
 void CTC1() {
@@ -270,14 +367,16 @@ void DIV_S() {
 */
 void MADD_S() {
 	FPRreg temp;
-	temp.f = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	temp.UL = eeMulProduct( _FsValUl_, _FtValUl_ );
 	_FdValf_  = fpuDouble( _FAValUl_ ) + fpuDouble( temp.UL );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void MADDA_S() {
-	_FAValf_ += fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	FPRreg temp;
+	temp.UL = eeMulProduct( _FsValUl_, _FtValUl_ );
+	_FAValf_ += temp.f;
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
@@ -303,14 +402,16 @@ void MOV_S() {
 
 void MSUB_S() {
 	FPRreg temp;
-	temp.f = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	temp.UL = eeMulProduct( _FsValUl_, _FtValUl_ );
 	_FdValf_  = fpuDouble( _FAValUl_ ) - fpuDouble( temp.UL );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void MSUBA_S() {
-	_FAValf_ -= fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	FPRreg temp;
+	temp.UL = eeMulProduct( _FsValUl_, _FtValUl_ );
+	_FAValf_ -= temp.f;
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
@@ -320,13 +421,13 @@ void MTC1() {
 }
 
 void MUL_S() {
-	_FdValf_  = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	_FdValUl_ = eeMulProduct( _FsValUl_, _FtValUl_ );
 	if (checkOverflow( _FdValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FdValUl_, FPUflagU | FPUflagSU);
 }
 
 void MULA_S() {
-	_FAValf_  = fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+	_FAValUl_ = eeMulProduct( _FsValUl_, _FtValUl_ );
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
@@ -342,7 +443,15 @@ void RSQRT_S() {
 
 	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) { // Ft is zero (Denormals are Zero)
 		_ContVal_ |= FPUflagD | FPUflagSD;
-		_FdValUl_ = ( _FtValUl_ & 0x80000000 ) | posFmax;
+		// The sign of FS ALONE. Unlike DIV.S there is no xor here: rsqrt
+		// divides by sqrt(|Ft|), so the divisor has no sign left to contribute
+		// by the time the division happens. Console rows witness it --
+		// rsqrt(+0, -0) is positive and rsqrt(-0, -0) is negative, and an xor
+		// rule (or Ft's sign, which this used) flips both. x86 recRSQRThelper1
+		// has always taken Fs's sign. The magnitude stays at posFmax, the
+		// shared saturation compromise -- silicon says 0x7FFFFFFF there, which
+		// is the top-binade question, not the sign question.
+		_FdValUl_ = ( _FsValUl_ & 0x80000000 ) | posFmax;
 		return;
 	}
 	else if ( _FtValUl_ & 0x80000000 ) { // Ft is negative
@@ -359,13 +468,55 @@ void RSQRT_S() {
 void SQRT_S() {
 	clearFPUFlags(FPUflagI | FPUflagD);
 
-	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) // If Ft = +/-0
-		_FdValUl_ = _FtValUl_ & 0x80000000;// result is 0
-	else if ( _FtValUl_ & 0x80000000 ) { // If Ft is Negative
+	// Invalid-operation keys off the SIGN BIT ALONE. -0 and the negative
+	// denormals raise it too, even though they are flushed to -0 and produce a
+	// perfectly ordinary +0: the exponent field plays no part. This used to sit
+	// inside the negative-normal arm below, so those two operand classes came
+	// back with FCR31 untouched. x86's recSQRT_S_xmm has always tested the sign
+	// bit alone (iFPU.cpp, MOVMSKPS & 1), as has the FULL-mode DOUBLE path in
+	// iFPUd-arm64.cpp. Scored against a first-party capture over the sign x
+	// exponent matrix -- see EeRecFpu.SqrtSInvalidFlagFollowsTheSignBitAlone.
+	if ( _FtValUl_ & 0x80000000 )
 		_ContVal_ |= FPUflagI | FPUflagSI;
-		_FdValf_ = sqrt( fabs( fpuDouble( _FtValUl_ ) ) );
-	} else
-		_FdValf_ = sqrt( fpuDouble( _FtValUl_ ) ); // If Ft is Positive
+
+	if ( ( _FtValUl_ & 0x7F800000 ) == 0 ) // If Ft = +/-0 (denormals included)
+	{
+		_FdValUl_ = 0;                     // +0: the EE drops the sign here, and
+		                                   // both recompilers already do (they
+		                                   // take |Ft| before the sqrt). See
+		                                   // EeRecFpu.SqrtSOfNegativeZeroIsPositiveZero.
+	}
+	else if ( ( _FtValUl_ & 0x7F800000 ) == 0x7F800000 )
+	{
+		// Exponent 255 is an ORDINARY binade on the EE -- no Inf, no NaN, and
+		// the representable max is 0x7FFFFFFF, not FLT_MAX. So fpuDouble()'s
+		// clamp is not a rounding of this operand, it is a different operand,
+		// and the answer lands two binades low: sqrt(2^128) came back as
+		// 0x5F7FFFFF where the console gives 0x5F800000, and sqrt(+EEMAX) as
+		// 0x5F7FFFFF against 0x5FB504F3.
+		//
+		// Square-root |Ft|/4 and double it. sqrt halves exponents, so the
+		// scaled operand (exponent field 253) and the doubled result are both
+		// ordinary representable singles -- no wider format is needed. 4 is an
+		// even power of two, so its own square root is exact and the identity
+		// contributes no rounding: the sqrt below is the only rounding step,
+		// exactly as on the untouched path. Same power-of-two prescale that
+		// ToDouble() uses to carry these operands into FULL mode
+		// (iFPUd-arm64.cpp), with the factor picked to suit sqrt so it can stay
+		// in single precision. The arm64 fast path emits the same two steps --
+		// see recSQRT_S_xmm in iFPU-arm64.cpp.
+		//
+		// RSQRT_S deliberately does NOT get this. Its two clamped operands
+		// currently cancel on rsqrt(2^128, 2^128); unclamping only the sqrt
+		// breaks that row. It is all-or-nothing and is a separate change.
+		FPRreg quarter;
+		quarter.UL = ( _FtValUl_ & 0x7FFFFFFF ) - 0x01000000; // |Ft| / 4
+		_FdValf_ = 2.0 * sqrt( (double)quarter.f );
+	}
+	else
+	{
+		_FdValf_ = sqrt( fabs( fpuDouble( _FtValUl_ ) ) ); // sqrt of |Ft|
+	}
 }
 
 void SUB_S() {

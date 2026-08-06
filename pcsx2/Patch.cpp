@@ -380,9 +380,17 @@ void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool che
 	// resident for the session. What actually keeps them from applying is ReloadEnabledLists
 	// emptying the enabled list and the cheat enable call sitting behind EnableCheats. The
 	// check here only saves the enumeration on later reloads.
+	// CHEATS are matched across ALL CRCs of the serial (the "{serial}_*.pnach" glob), not just the
+	// running game's CRC. The in-app cheat editor writes "{serial}_00000000.pnach" whenever it can't
+	// read a live CRC (getGameCRC() returns the literal "00000000" with no VM up), and PATCHES the
+	// user pastes/imports are commonly named for a different revision's CRC — either way a
+	// CRC-specific boot-time glob silently drops them ("no cheats found" with the file sitting right
+	// there in the list). Cheats are serial-scoped by nature, so widening them to all_crcs recovers
+	// those files without a re-install. Real fixes/widescreen (cheats == false) stay CRC-specific at
+	// boot so a wrong-revision graphics patch can't auto-apply.
 	std::vector<std::string> disk_patch_files;
 	if (for_ui || !cheats || !Achievements::IsHardcoreModeActive())
-		disk_patch_files = FindPatchFilesOnDisk(serial, crc, cheats, for_ui);
+		disk_patch_files = FindPatchFilesOnDisk(serial, crc, cheats, for_ui || cheats);
 
 	bool unlabeled_patch_found = false;
 	if (!disk_patch_files.empty())
@@ -405,7 +413,15 @@ void Patch::EnumeratePnachFiles(const std::string_view serial, u32 crc, bool che
 	}
 
 	// Otherwise fall back to the zip.
-	if (cheats || unlabeled_patch_found || !OpenPatchesZip())
+	//
+	// "Otherwise" has to include "a disk file was found", which it previously didn't: the guard
+	// ignored disk_patch_files, so the bundled copy loaded ALONGSIDE the user's file every time,
+	// contradicting the "prefer files on disk" comment above. Two user-visible consequences, both
+	// reported: a hand-edited pnach couldn't fully replace the bundled one (dedupe-by-name only
+	// hid the bundled group while the disk name existed), and DELETING a pnach silently promoted
+	// the identically-named bundled group in its place — so a patch the user had removed carried
+	// on applying, with nothing left on disk to explain why.
+	if (cheats || unlabeled_patch_found || !disk_patch_files.empty() || !OpenPatchesZip())
 		return;
 
 	// Prefer filename with serial.
@@ -908,6 +924,12 @@ bool Patch::ReloadPatchAffectingOptions()
 	EmuConfig.GS.AspectRatio = new_ar;
 	EmuConfig.GS.InterlaceMode = static_cast<GSInterlaceMode>(Host::GetIntSettingValue(
 		"EmuCore/GS", "deinterlace_mode", static_cast<int>(Pcsx2Config::GSOptions::DEFAULT_INTERLACE_MODE)));
+
+	// Clear the patch-requested aspect before re-deriving it. ApplyPatchSettingOverrides only ever
+	// SETS CurrentCustomAspectRatio, so without this the last widescreen patch's ratio survived
+	// the patch being disabled and GSRenderer kept reading it (it takes any value > 0 in
+	// preference to the real aspect) — i.e. "I turned widescreen off and the game is still 16:9".
+	EmuConfig.CurrentCustomAspectRatio = 0.0f;
 
 	ApplyPatchSettingOverrides();
 

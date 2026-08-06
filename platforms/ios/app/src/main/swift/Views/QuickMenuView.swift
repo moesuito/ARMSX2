@@ -24,6 +24,8 @@ enum QuickMenuDestination: Equatable {
 /// view to the bounded card size): two columns when the card is comfortably wide, one column
 /// otherwise. Resume is pinned inside the panel footer so it never detaches or hides rows.
 struct QuickMenuView: View {
+    @State private var showStopConfirmation = false
+
     let settings: SettingsStore
     @Binding var padVisible: Bool
     @Binding var fullScreen: Bool
@@ -42,6 +44,7 @@ struct QuickMenuView: View {
     let onOpen: (QuickMenuDestination) -> Void
     let onClearCache: () -> Void
     let onBackToMenu: () -> Void
+    let onStop: () -> Void
     let onResume: () -> Void
 
     /// Compact sizing for the header/footer on iPad (any orientation) and iPhone landscape; the
@@ -58,6 +61,12 @@ struct QuickMenuView: View {
             \.clearLiquidGlassUIEnabled,
             settings.clearLiquidGlassUIQuickMenu
         )
+        .alert(settings.localized("Stop Emulation?"), isPresented: $showStopConfirmation) {
+            Button(settings.localized("Cancel"), role: .cancel) {}
+            Button(settings.localized("Stop"), role: .destructive, action: onStop)
+        } message: {
+            Text(settings.localized("This will shut down the running game. All unsaved progress will be lost."))
+        }
     }
 
     @ViewBuilder
@@ -92,6 +101,7 @@ struct QuickMenuView: View {
                 LandscapeCommandBar(
                     settings: settings,
                     gameTitle: gameTitle,
+                    onStop: { showStopConfirmation = true },
                     onResume: onResume,
                     iconOnly: width < 380
                 )
@@ -155,11 +165,11 @@ struct QuickMenuView: View {
             cardsContent(twoColumns: twoColumns)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            OverlayFooter(
-                primaryLabel: settings.localized("Resume"),
-                primarySystemImage: "play.fill",
-                primaryAction: onResume,
-                compact: compact
+            QuickMenuFooter(
+                settings: settings,
+                compact: compact,
+                onStop: { showStopConfirmation = true },
+                onResume: onResume
             )
         }
     }
@@ -183,7 +193,7 @@ struct QuickMenuView: View {
                 .font(.caption)
                 .foregroundStyle(OverlayTheme.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 34)
+                .padding(.leading, OverlayTheme.rowLabelInset)
                 .padding(.bottom, 4)
         }
 
@@ -194,14 +204,14 @@ struct QuickMenuView: View {
             label: settings.localized("Hide Menu Button"),
             systemImage: "eye.slash",
             isOn: Binding(
-                get: { menuButtonHidden || settings.hideMenuButton },
+                get: { settings.hideMenuButton },
                 set: { newValue in
                     menuButtonHidden = newValue
                     settings.hideMenuButton = newValue
                 }
             )
         )
-        .accessibilityHint(settings.localized("Tap the game area or press any controller button to show it again"))
+        .accessibilityHint(settings.localized("Tap the game area to show it briefly"))
 
         if vmMenuAvailable {
             OverlayActionRow(label: settings.localized("Speed / Fast Forward"), systemImage: "forward.fill") {
@@ -256,15 +266,16 @@ struct QuickMenuView: View {
             OverlayActionRow(label: settings.localized("Clear Current Game Cache"), systemImage: "trash.slash", action: onClearCache)
         }
         OverlayActionRow(label: settings.localized("Back to Menu"), systemImage: "list.bullet", action: onBackToMenu)
-            .accessibilityHint(settings.localized("Quits this game and returns to the library"))
+            .accessibilityHint(settings.localized("Leaves the game paused and returns to the library"))
     }
 
-    /// Hosts an injected SwiftUI `Menu` (controller skin / change disc) as a row that matches the
-    /// action rows as closely as an opaque AnyView allows. The menu's own action
-    /// semantics are untouched.
+    /// Hosts an injected SwiftUI `Menu` (controller skin / change disc) as a row matching the
+    /// action rows. Their labels are plain `Label`s, so without the style they sit on `Label`'s own
+    /// icon column and land short of everything else in the card.
     @ViewBuilder
     private func injectedMenuRow(_ menu: AnyView) -> some View {
         menu
+            .labelStyle(OverlayRowLabelStyle())
             .foregroundStyle(OverlayTheme.textPrimary)
             .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
     }
@@ -273,6 +284,7 @@ struct QuickMenuView: View {
 private struct LandscapeCommandBar: View {
     let settings: SettingsStore
     let gameTitle: String?
+    let onStop: () -> Void
     let onResume: () -> Void
     let iconOnly: Bool
 
@@ -295,6 +307,11 @@ private struct LandscapeCommandBar: View {
                         .layoutPriority(-1)
                 }
                 Spacer(minLength: 8)
+                QuickMenuStopButton(
+                    accessibilityLabel: settings.localized("Stop"),
+                    compact: true,
+                    action: onStop
+                )
                 Button(action: onResume) {
                     if iconOnly {
                         Image(systemName: "play.fill")
@@ -310,5 +327,57 @@ private struct LandscapeCommandBar: View {
             OverlayTheme.separator
                 .frame(height: 0.5)
         }
+    }
+}
+
+private struct QuickMenuFooter: View {
+    let settings: SettingsStore
+    let compact: Bool
+    let onStop: () -> Void
+    let onResume: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            OverlayTheme.separator
+                .frame(height: 0.5)
+            HStack(spacing: compact ? 10 : 12) {
+                QuickMenuStopButton(
+                    accessibilityLabel: settings.localized("Stop"),
+                    compact: compact,
+                    action: onStop
+                )
+                Button(action: onResume) {
+                    Label(settings.localized("Resume"), systemImage: "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(compact ? .regular : .large)
+                .tint(OverlayTheme.accent)
+            }
+            .padding(.horizontal, compact ? 18 : 20)
+            .padding(.top, 8)
+            .padding(.bottom, compact ? 10 : 14)
+        }
+    }
+}
+
+private struct QuickMenuStopButton: View {
+    let accessibilityLabel: String
+    let compact: Bool
+    let action: () -> Void
+
+    private var diameter: CGFloat { compact ? 36 : 46 }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "stop.fill")
+                .font(.system(size: compact ? 13 : 16, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: diameter, height: diameter)
+                .background(Color.red, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .contentShape(Circle())
+        .accessibilityLabel(accessibilityLabel)
     }
 }

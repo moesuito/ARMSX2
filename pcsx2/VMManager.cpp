@@ -94,6 +94,7 @@ namespace VMManager
 	static void InitializeCPUProviders();
 	static void ShutdownCPUProviders();
 	static void UpdateCPUImplementations();
+	static void ClampRuntimeConfigToAvailableCPUProviders();
 
 	static void ApplyGameFixes();
 	static bool UpdateGameSettingsLayer();
@@ -170,6 +171,7 @@ static std::atomic_bool s_boot_patches_applied{false};
 static std::atomic_bool s_texture_replacement_startup_complete{false};
 static std::atomic_bool s_emulation_only_startup_notification_posted{false};
 static bool s_cpu_implementation_changed = false;
+static bool s_cpu_providers_initialized = false;
 static Threading::ThreadHandle s_vm_thread_handle;
 
 static bool ArePatchesDisabledByEmulationOnlyMode()
@@ -457,18 +459,15 @@ bool VMManager::Internal::CPUThreadInitialize()
 	// We want settings loaded so we choose the correct renderer for big picture mode.
 	// This also sorts out input sources.
 	LoadSettings();
-
-	// LoadSettings() re-reads EnableFastmem from the INI, clobbering the runtime
-	// disable that vtlb_Core_Alloc applied when the 4 GB fastmem area failed to
-	// allocate on low-VA devices (e.g. iPhone SE 2). Re-apply the disable from
-	// the sticky flag so the EE recompiler does not emit fastmem load/store
-	// against a null base. The flag is process-lifetime: once the area fails,
-	// it stays failed.
-	if (vtlb_FastmemAreaUnavailable() && EmuConfig.Cpu.Recompiler.EnableFastmem)
-	{
-		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
-		Console.Warning("Fastmem re-disabled after settings reload (area allocation previously failed)");
-	}
+	Console.WriteLn(
+		"@@CPU_BACKEND@@ code_generation=%d ee_rec=%d iop_rec=%d vu0_rec=%d vu1_rec=%d fastmem=%d mtvu=%d",
+		SysMemory::HasCodeMemory() ? 1 : 0,
+		EmuConfig.Cpu.Recompiler.EnableEE ? 1 : 0,
+		EmuConfig.Cpu.Recompiler.EnableIOP ? 1 : 0,
+		EmuConfig.Cpu.Recompiler.EnableVU0 ? 1 : 0,
+		EmuConfig.Cpu.Recompiler.EnableVU1 ? 1 : 0,
+		EmuConfig.Cpu.Recompiler.EnableFastmem ? 1 : 0,
+		EmuConfig.Speedhacks.vuThread ? 1 : 0);
 
 	if (EmuConfig.Achievements.Enabled && !Achievements::IsActive())
 		Achievements::Initialize();
@@ -728,6 +727,12 @@ void VMManager::LoadCoreSettings(SettingsInterface& si)
 {
 	SettingsLoadWrapper slw(si);
 	EmuConfig.LoadSave(slw);
+
+	// A game file's UserHackOverrides replaces the base mask outright, and the
+	// player's global claims still stand here.
+	if (SettingsInterface* base = Host::Internal::GetBaseSettingsLayer(); base && base != &si)
+		EmuConfig.GS.UserHackOverrides |= static_cast<u32>(base->GetIntValue("EmuCore/GS", "UserHackOverrides", 0));
+
 	Patch::ApplyPatchSettingOverrides();
 
 	// Achievements hardcore mode disallows setting some configuration options.
@@ -746,6 +751,25 @@ void VMManager::LoadCoreSettings(SettingsInterface& si)
 	static const bool s_mvu_diff_env = (std::getenv("MVU_DIFF") != nullptr);
 	if (s_mvu_diff_env)
 		EmuConfig.Speedhacks.vuThread = false;
+
+	// The 4 GB fastmem reservation can fail outright on a low VA device, and the
+	// INI still says fastmem is on, so every reload from here turns it back on
+	// against a base that was never mapped. The flag is sticky for the life of
+	// the process. It belongs here rather than at the call sites: it used to be
+	// re-applied by hand after each load, and the ELF change path was missed.
+	if (vtlb_FastmemAreaUnavailable() && EmuConfig.Cpu.Recompiler.EnableFastmem)
+	{
+		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
+
+		static bool s_warned_fastmem_reload = false;
+		if (!s_warned_fastmem_reload)
+		{
+			s_warned_fastmem_reload = true;
+			Console.Warning("Fastmem re-disabled after settings reload (area allocation previously failed)");
+		}
+	}
+
+	ClampRuntimeConfigToAvailableCPUProviders();
 }
 
 void VMManager::LoadInputBindings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
@@ -868,9 +892,6 @@ void VMManager::ApplySettings()
 	EmuConfig = Pcsx2Config();
 	EmuConfig.CopyRuntimeConfig(old_config);
 	LoadSettings();
-	// Re-apply the sticky fastmem-area-unavailable disable (see CPUThreadInitialize).
-	if (vtlb_FastmemAreaUnavailable() && EmuConfig.Cpu.Recompiler.EnableFastmem)
-		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 	CheckForConfigChanges(old_config);
 	if (s_emulation_only_mode.load(std::memory_order_acquire))
 		ReleaseNonEssentialRuntimeResources(s_emulation_only_release_flags.load(std::memory_order_acquire));
@@ -1047,6 +1068,20 @@ void VMManager::RequestDisplaySize(float scale /*= 0.0f*/)
 			break;
 		case AspectRatioType::R10_7:
 			x_scale = (10.0f / 7.0f) / (static_cast<float>(iwidth) / static_cast<float>(iheight));
+			break;
+		// These two were missing, so requesting a display size under an ultrawide ratio fell
+		// through to the Stretch case and asked for an unscaled (4:3-shaped) window.
+		case AspectRatioType::R21_9:
+			x_scale = (21.0f / 9.0f) / (static_cast<float>(iwidth) / static_cast<float>(iheight));
+			break;
+		case AspectRatioType::R20_9:
+			x_scale = (20.0f / 9.0f) / (static_cast<float>(iwidth) / static_cast<float>(iheight));
+			break;
+		case AspectRatioType::R19_5_9:
+			x_scale = (19.5f / 9.0f) / (static_cast<float>(iwidth) / static_cast<float>(iheight));
+			break;
+		case AspectRatioType::Custom:
+			x_scale = std::clamp(GSConfig.CustomAspectRatio, 0.5f, 5.0f) / (static_cast<float>(iwidth) / static_cast<float>(iheight));
 			break;
 		case AspectRatioType::Stretch:
 		default:
@@ -2835,6 +2870,13 @@ void VMManager::LogCPUCapabilities()
 
 void VMManager::InitializeCPUProviders()
 {
+	pxAssert(!s_cpu_providers_initialized);
+	if (!SysMemory::HasCodeMemory())
+	{
+		Console.Warning("Executable code memory is unavailable; skipping recompiler provider initialization");
+		return;
+	}
+
 	recCpu.Reserve();
 	psxRec.Reserve();
 
@@ -2842,10 +2884,14 @@ void VMManager::InitializeCPUProviders()
 	CpuMicroVU1.Reserve();
 
 	VifUnpackSSE_Init();
+	s_cpu_providers_initialized = true;
 }
 
 void VMManager::ShutdownCPUProviders()
 {
+	if (!s_cpu_providers_initialized)
+		return;
+
 	if (newVifDynaRec)
 	{
 		dVifRelease(1);
@@ -2857,6 +2903,8 @@ void VMManager::ShutdownCPUProviders()
 
 	psxRec.Shutdown();
 	recCpu.Shutdown();
+
+	s_cpu_providers_initialized = false;
 }
 
 void VMManager::UpdateCPUImplementations()
@@ -2864,6 +2912,15 @@ void VMManager::UpdateCPUImplementations()
 	if (GSDumpReplayer::IsReplayingDump())
 	{
 		Cpu = &GSDumpReplayerCpu;
+		psxCpu = &psxInt;
+		CpuVU0 = &CpuIntVU0;
+		CpuVU1 = &CpuIntVU1;
+		return;
+	}
+
+	if (!SysMemory::HasCodeMemory())
+	{
+		Cpu = &intCpu;
 		psxCpu = &psxInt;
 		CpuVU0 = &CpuIntVU0;
 		CpuVU1 = &CpuIntVU1;
@@ -2882,17 +2939,50 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 	Cpu->Reset();
 	psxCpu->Reset();
 
-	// mVU's VU0 needs to be properly initialized for macro mode even if it's not used for micro mode!
-	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
-		CpuMicroVU0.Reset();
+	if (s_cpu_providers_initialized)
+	{
+		// mVU's VU0 needs to be properly initialized for macro mode even if it's not used for micro mode!
+		if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
+			CpuMicroVU0.Reset();
+
+		if constexpr (newVifDynaRec)
+		{
+			dVifReset(0);
+			dVifReset(1);
+		}
+	}
 
 	CpuVU0->Reset();
 	CpuVU1->Reset();
+}
 
-	if constexpr (newVifDynaRec)
+void VMManager::ClampRuntimeConfigToAvailableCPUProviders()
+{
+	// LoadCoreSettings also runs during app startup, before CPUThreadInitialize
+	// establishes the VM memory capability. Do not interpret that unallocated
+	// state as an interpreter-only session.
+	if (!SysMemory::IsAllocated() || SysMemory::HasCodeMemory())
+		return;
+
+	const bool was_using_recompiler =
+		EmuConfig.Cpu.Recompiler.EnableEE ||
+		EmuConfig.Cpu.Recompiler.EnableIOP ||
+		EmuConfig.Cpu.Recompiler.EnableVU0 ||
+		EmuConfig.Cpu.Recompiler.EnableVU1 ||
+		EmuConfig.Cpu.Recompiler.EnableFastmem ||
+		EmuConfig.Speedhacks.vuThread;
+
+	EmuConfig.Cpu.Recompiler.EnableEE = false;
+	EmuConfig.Cpu.Recompiler.EnableIOP = false;
+	EmuConfig.Cpu.Recompiler.EnableVU0 = false;
+	EmuConfig.Cpu.Recompiler.EnableVU1 = false;
+	EmuConfig.Cpu.Recompiler.EnableFastmem = false;
+	EmuConfig.Speedhacks.vuThread = false;
+
+	if (was_using_recompiler)
 	{
-		dVifReset(0);
-		dVifReset(1);
+		Console.Warning(
+			"Executable code memory is unavailable; using EE, IOP, VU0, and VU1 interpreters with fastmem and MTVU disabled");
 	}
 }
 
@@ -3264,6 +3354,13 @@ void VMManager::CheckForMiscConfigChanges(const Pcsx2Config& old_config)
 
 void VMManager::CheckForConfigChanges(const Pcsx2Config& old_config)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	// GSreopen would recreate the Metal device under the running game, so a
+	// renderer change brought in by a reload waits for the next boot.
+	if (MTGS::IsOpen())
+		EmuConfig.GS.Renderer = old_config.GS.Renderer;
+#endif
+
 	if (HasValidVM())
 	{
 		CheckForCPUConfigChanges(old_config);

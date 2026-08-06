@@ -11,7 +11,7 @@ struct FramePacingTab: View {
 
     // Per-game individual-control bindings shared with GraphicsTab / AudioTab.
     @Binding var perGameFrameLimiter: Int
-    @Binding var perGameTargetFPS: Int
+    @Binding var perGameTargetFPS: Float
     @Binding var perGameVsyncQueue: Int
     @Binding var perGameSyncToHostRefresh: Int
     @Binding var perGameBufferMS: Int
@@ -53,17 +53,15 @@ struct FramePacingTab: View {
                 }
                 .disabled(!enabled)
 
-                Picker(settings.localized("FPS Target"), selection: $perGameTargetFPS) {
-                    Text(settings.localized("Use Global")).tag(-1)
-                    ForEach([30, 45, 60, 90, 120], id: \.self) { Text("\($0)").tag($0) }
-                }
-                .disabled(perGameFrameLimiter == 0 || !enabled)
+                FloatOverrideRow(.targetFPS, value: $perGameTargetFPS,
+                                 global: settings.targetFPS,
+                                 settings: settings)
+                    .disabled(perGameFrameLimiter == 0 || !enabled)
 
-                Picker(settings.localized("VSync Queue Size"), selection: $perGameVsyncQueue) {
-                    Text(settings.localized("Use Global")).tag(-1)
-                    ForEach([2, 3, 4, 5, 6, 8, 10, 12, 16], id: \.self) { Text("\($0)").tag($0) }
-                }
-                .disabled(!enabled)
+                NumberOverrideRow(.vsyncQueueSize, value: $perGameVsyncQueue,
+                                  global: settings.vsyncQueueSize,
+                                  settings: settings)
+                    .disabled(!enabled)
 
                 Picker(settings.localized("Sync to Host Refresh"), selection: $perGameSyncToHostRefresh) {
                     Text(settings.localized("Use Global")).tag(-1)
@@ -75,17 +73,15 @@ struct FramePacingTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Picker(settings.localized("Buffer Size"), selection: $perGameBufferMS) {
-                    Text(settings.localized("Use Global")).tag(-1)
-                    ForEach([10, 25, 50, 75, 100, 150, 200], id: \.self) { Text("\($0) ms").tag($0) }
-                }
-                .disabled(!enabled)
+                NumberOverrideRow(.audioBufferMs, value: $perGameBufferMS,
+                                  global: settings.audioBufferMs,
+                                  settings: settings)
+                    .disabled(!enabled)
 
-                Picker(settings.localized("Output Latency"), selection: $perGameOutputLatencyMS) {
-                    Text(settings.localized("Use Global")).tag(-1)
-                    ForEach([5, 10, 20, 30, 50, 100, 200], id: \.self) { Text("\($0) ms").tag($0) }
-                }
-                .disabled(!enabled)
+                NumberOverrideRow(.audioOutputLatencyMs, value: $perGameOutputLatencyMS,
+                                  global: settings.audioOutputLatencyMs,
+                                  settings: settings)
+                    .disabled(!enabled)
             } header: {
                 Text(settings.localized("Individual Settings"))
             }

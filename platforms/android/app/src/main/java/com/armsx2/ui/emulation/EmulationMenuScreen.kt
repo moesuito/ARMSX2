@@ -83,6 +83,7 @@ import com.armsx2.ui.theme.Success
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @Composable
 fun EmulationMenuScreen(viewModel: EmulationMenuViewModel = viewModel()) {
@@ -588,6 +589,14 @@ private fun MenuHeader(
             }
         }
 
+        // Clock + battery, same cluster as the library toolbar. Worth having here specifically:
+        // this menu is what you open mid-session on a handheld, so it's exactly when you want to
+        // know the time and how much charge is left. Not controllerFocusable — it's a readout.
+        Spacer(Modifier.width(8.dp))
+        com.armsx2.ui.common.LibraryStatusCluster(
+            Modifier.align(Alignment.CenterVertically),
+        )
+
         // Friends, in the header where it is always visible, with the online count on it. A build
         // without the SDK has nothing to show, so it does not take up header space there.
         if (com.armsx2.DiscordPresence.available()) {
@@ -791,6 +800,19 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         selected = settings.upscaleFloat,
         onSelect = viewModel::setUpscale,
     )
+    // Custom internal resolution, same control as the settings tab — the quick menu only offered
+    // the preset steps, so a value between them (or set per-game) could be neither seen nor
+    // changed from in-game. Percentage of native: 107% is roughly true 480p height.
+    com.armsx2.ui.settings.IntSliderRow(
+        label = str("renderer.upscale.customScale"),
+        value = (settings.upscaleFloat * 100f).roundToInt().coerceIn(25, 800),
+        min = 25,
+        max = 800,
+        description = str("renderer.upscale.customScale.description"),
+        valueFormatter = { "$it%" },
+        onReset = { viewModel.setUpscale(1.0f) },
+        onChange = { pct -> viewModel.setUpscale(pct / 100f) },
+    )
     HorizontalOptions(
         title = str("renderer.displayMode.label"),
         options = listOf(
@@ -800,10 +822,38 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
             3 to "16:9",
             4 to "10:7",
             5 to "21:9",
+            6 to "20:9",
+            7 to "19.5:9",
+            8 to "Custom",
         ),
         selected = settings.aspectRatio,
         onSelect = viewModel::setAspectRatio,
     )
+    // Overlay artwork, switchable from in-game — trying bezels means seeing them ON the game, and
+    // having to leave for All Settings each time made that unusable. Import still lives in the
+    // settings tab (it opens a file picker); this is the picker for what is already imported.
+    run {
+        val overlayCtx = androidx.compose.ui.platform.LocalContext.current
+        val entries = remember { com.armsx2.OverlayRepo.list(overlayCtx) }
+        // Shown even with nothing imported. Hiding it when the list was empty is why this looked
+        // absent from the in-game menu entirely — with no overlays there was no row to find, and
+        // no hint that the feature existed or where to add one.
+        HorizontalOptions(
+            title = str("renderer.overlayArt.label"),
+            options = listOf("" to str("renderer.overlayArt.none")) +
+                entries.map { it.imagePath to it.name },
+            selected = com.armsx2.OverlayRepo.activePath.value,
+            onSelect = { com.armsx2.OverlayRepo.setActive(it) },
+        )
+        if (entries.isEmpty()) {
+            Text(
+                str("renderer.overlayArt.emptyHint"),
+                color = Color(0xFF9AA0A6),
+                fontSize = 12.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            )
+        }
+    }
     HorizontalOptions(
         title = str("renderer.blendingAccuracy.label"),
         options = listOf("Minimum", "Basic", "Medium", "High", str("fixes.opt.full"), str("fixes.opt.max")).mapIndexed { index, label -> index to label },
@@ -1079,6 +1129,40 @@ private fun ControlsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
     MenuSwitchRow(str("pad.multitap.label"), state.multitapEnabled, onCheckedChange = viewModel::setMultitap)
     MenuSwitchRow(str("network.emulateUsbKeyboard"), state.settings.usbKeyboard) {
         viewModel.updateSettings { current -> current.copy(usbKeyboard = it) }
+    }
+
+    // Gesture control, in-game. Worth having here rather than only in All Settings: the swipe
+    // distance and the Tap/Hold choice are things you only discover the right value for while
+    // actually playing, and walking out to the settings tree to nudge them loses the moment.
+    // Local state, like the haptic slider above — these are plain prefs, not part of the ui state.
+    var gestureOn by remember { mutableStateOf(TouchControls.gestureEnabled.value) }
+    MenuSwitchRow(str("pad.gesture.enable.label"), gestureOn) {
+        gestureOn = it
+        TouchControls.setGestureEnabled(it)
+    }
+    if (gestureOn) {
+        var swipeSens by remember { mutableStateOf((TouchControls.gestureSwipeSensitivity.floatValue * 100f).toInt()) }
+        com.armsx2.ui.settings.IntSliderRow(
+            label = str("pad.gesture.sensitivity.label"),
+            value = swipeSens,
+            min = 5,
+            max = 60,
+            description = str("pad.gesture.sensitivity.description"),
+            valueFormatter = { "${it}%" },
+            onChange = { swipeSens = it; TouchControls.setGestureSensitivity(it / 100f) },
+        )
+        var holdMode by remember { mutableStateOf(TouchControls.gestureDoubleTapHold.value) }
+        HorizontalOptions(
+            title = str("pad.gesture.doubleTapMode.label"),
+            options = listOf(
+                0 to str("pad.gesture.doubleTapMode.tap"),
+                1 to str("pad.gesture.doubleTapMode.hold"),
+            ),
+            selected = if (holdMode) 1 else 0,
+            onSelect = { holdMode = it == 1; TouchControls.setGestureDoubleTapHold(holdMode) },
+        )
+        // The four swipe/double-tap ASSIGNMENTS stay in All Settings — six button pickers would
+        // swamp this pane, and you set them once rather than mid-session.
     }
     CompactAction(str("pad.controllerMapping"), "⌁", Modifier.fillMaxWidth(), viewModel::openControlsManager)
     Spacer(Modifier.height(6.dp))

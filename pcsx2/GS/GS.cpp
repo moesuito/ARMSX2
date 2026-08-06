@@ -292,15 +292,31 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 
 	// GV7-1d-ii: instantiate the front parser only when the back thread really
 	// engaged (the renderer ctor falls back to inline records on a non-Vulkan
-	// HW device). Unsynchronized HW downloads read local memory from the EE
-	// thread with no drain — that session runs single-object (lockstep).
+	// HW device). An EE-thread read of *live* local memory forces single-object
+	// (lockstep) — see below for why that is not every EE-thread read.
 	if (GSConfig.BackThreadMode == GSBackThreadMode::Pipelined && g_gs_renderer->IsBackThreadRunning())
 	{
-		// Asynchronous joins Unsynchronized here: both read GS local memory from the EE thread
-		// with no drain point, so neither can run against a separate front parser object.
-		if (IsHardwareDownloadEEThreadRead(GSConfig.HWDownloadMode) && GSConfig.UseHardwareRenderer())
+		// Which thread performs the readback is the wrong question here; what it reads is the
+		// right one. Unsynchronized takes GS local memory directly, with no lock and no drain,
+		// so a queued back thread leaves it arbitrarily far behind what the EE expects.
+		// Asynchronous instead takes the CPU shadow under m_async_readback_mutex, and that
+		// mutex is the synchronization point: the shadow only moves when the GS thread
+		// publishes a completed GPU download, never when a record is queued or executed. Queue
+		// depth therefore cannot change what the EE sees, and every shadow accessor already
+		// routes through m_mem_target, so a front object reaches the back's authoritative copy.
+		//
+		// The one exception is a shadow that never came up — ReadLocalMemoryUnsync then falls
+		// back to live local memory, which is exactly the Unsynchronized hazard, now against a
+		// concurrently drawing back thread. The renderer is already constructed at this point,
+		// so its shadow state is the thing to ask.
+		const bool ee_thread_reads_live_memory =
+			GSConfig.HWDownloadMode == GSHardwareDownloadMode::Unsynchronized ||
+			(GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous &&
+				!g_gs_renderer->IsAsyncReadbackReady());
+
+		if (ee_thread_reads_live_memory && GSConfig.UseHardwareRenderer())
 		{
-			Console.Warning("GS: pipelined mode is unsupported with EE-thread HW downloads — running lockstep.");
+			Console.Warning("GS: pipelined mode is unsupported with EE-thread reads of live GS memory — running lockstep.");
 		}
 		else
 		{
@@ -578,32 +594,43 @@ u32 GSGetManualFrameSkip()
 	return s_manual_frameskip.load(std::memory_order_relaxed);
 }
 
-// Max presented-FPS cap (Android). Caps the DISPLAY frame rate without slowing
-// emulation — read on the GS thread in GSRenderer::VSync, which drops a present
-// only when ahead of the target interval (adaptive, no over-skip). 0 = off.
-// s_max_present_fps is the cap value (for the OSD label); s_max_present_interval
-// is the vsync-aligned minimum present spacing in CPU ticks, computed in
-// native-lib setFpsCap where the native refresh is known, so display rates snap
-// to whole vsync multiples (60/30/20/15…) and hold steady at the boundary.
+// Caps display presentation without slowing emulation. The interval controls the
+// exact cadence while milli-FPS preserves fractional targets for the OSD.
 static std::atomic<u32> s_max_present_fps{0};
+static std::atomic<u32> s_max_present_milli_fps{0};
 static std::atomic<u64> s_max_present_interval{0};
+static std::atomic<bool> s_present_cap_render_skip{false};
 // Fast-forward (Turbo) bypasses the present cap so the speed-up is visible. Set
 // from the limiter-mode JNI (Turbo → true, anything else → false) and read on
 // the GS thread in GSRenderer::VSync. Unlimited (frame-limit-off steady state)
 // deliberately does NOT set this — there the present cap is still wanted.
 static std::atomic<bool> s_present_cap_suspended{false};
-void GSSetMaxPresentFps(u32 fps, u64 present_interval)
+void GSSetMaxPresentFps(u32 fps, u64 present_interval, u32 milli_fps)
 {
 	s_max_present_fps.store(fps, std::memory_order_relaxed);
+	s_max_present_milli_fps.store(present_interval == 0 ? 0 : (milli_fps != 0 ? milli_fps : fps * 1000),
+		std::memory_order_relaxed);
 	s_max_present_interval.store(present_interval, std::memory_order_relaxed);
 }
 u32 GSGetMaxPresentFps()
 {
 	return s_max_present_fps.load(std::memory_order_relaxed);
 }
+u32 GSGetMaxPresentMilliFps()
+{
+	return s_max_present_milli_fps.load(std::memory_order_relaxed);
+}
 u64 GSGetMaxPresentInterval()
 {
 	return s_max_present_interval.load(std::memory_order_relaxed);
+}
+void GSSetPresentCapRenderSkip(bool enabled)
+{
+	s_present_cap_render_skip.store(enabled, std::memory_order_relaxed);
+}
+bool GSGetPresentCapRenderSkip()
+{
+	return s_present_cap_render_skip.load(std::memory_order_relaxed);
 }
 void GSSetPresentCapSuspended(bool suspended)
 {
@@ -664,22 +691,25 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 	}
 }
 
-void GSQueueSnapshot(const std::string& path, u32 gsdump_frames)
+bool GSQueueSnapshot(const std::string& path, u32 gsdump_frames)
 {
-	// GV7-1d-ii known gap: the GSDump transfer hook sits on the parse path, so
-	// under the two-object split the front's transfers would be missing from
-	// the dump (GV7-2 item). Warn rather than write a corrupt dump silently.
-	if (g_gs_front)
-		Console.Warning("GS: dump recording under GSBackThreadMode=Pipelined is not yet supported; expect an incomplete dump.");
-
-	if (g_gs_renderer)
-		g_gs_renderer->QueueSnapshot(path, gsdump_frames);
+	return g_gs_renderer && g_gs_renderer->QueueSnapshot(path, gsdump_frames);
 }
 
 void GSStopGSDump()
 {
 	if (g_gs_renderer)
 		g_gs_renderer->StopGSDump();
+}
+
+bool GSIsDumpRecording()
+{
+	return g_gs_renderer && g_gs_renderer->IsDumpRecording();
+}
+
+bool GSHasFrontParser()
+{
+	return static_cast<bool>(g_gs_front);
 }
 
 bool GSBeginCapture(std::string filename)

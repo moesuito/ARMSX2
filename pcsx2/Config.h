@@ -233,6 +233,17 @@ enum class AspectRatioType : u8
 	// and tablet users, DeX, and phones driving a 21:9 display, who otherwise had to use
 	// Stretch and accept the distortion.
 	R21_9,
+	// 20:9 is the real panel ratio of most modern phones, which 21:9 only approximates -- close
+	// enough to leave thin black bars. Appended rather than slotted in next to R21_9 on purpose:
+	// these values are persisted as raw ints in the ini and in the Android prefs, so inserting
+	// mid-enum would silently repoint every saved 21:9 config at a different ratio.
+	R20_9,
+	// 19.5:9 — the other common modern phone ratio (many Xiaomi/Samsung panels). Appended, not
+	// slotted next to R20_9, for the same persisted-raw-int reason documented above.
+	R19_5_9,
+	// User-entered ratio (GSOptions::CustomAspectRatio). Last on purpose: it is the catch-all for
+	// panels none of the fixed entries match, and appending keeps every persisted index stable.
+	Custom,
 	MaxCount
 };
 
@@ -248,6 +259,10 @@ enum class FMVAspectRatioSwitchType : u8
 	// and tablet users, DeX, and phones driving a 21:9 display, who otherwise had to use
 	// Stretch and accept the distortion.
 	R21_9,
+	// See AspectRatioType::R20_9 -- appended for the same persisted-index reason.
+	R20_9,
+	R19_5_9,
+	Custom,
 	MaxCount
 };
 
@@ -441,8 +456,12 @@ constexpr bool IsHardwareDownloadReadbackEnabled(GSHardwareDownloadMode mode)
 	       mode == GSHardwareDownloadMode::Asynchronous;
 }
 
-/// True when the EE thread reads GS local memory itself, without synchronizing the GS thread.
-/// These modes cannot run with a separate GS front-parser object (no drain point exists).
+/// True when the EE thread services the readback itself instead of waiting on the GS thread.
+/// Both modes therefore need the GS thread synchronized around anything that reopens the
+/// renderer underneath them. NOTE: this says nothing about *what* gets read — Unsynchronized
+/// takes live local memory, Asynchronous takes the mutex-guarded CPU shadow — so it is not the
+/// right question to ask about the pipelined front-object split, which cares only about live
+/// reads. GS.cpp tests that directly.
 constexpr bool IsHardwareDownloadEEThreadRead(GSHardwareDownloadMode mode)
 {
 	return mode == GSHardwareDownloadMode::Unsynchronized ||
@@ -536,8 +555,10 @@ enum class GSUserHackOverride : u8
 	AutoFlush,
 	TextureInsideRt,
 	// Appended rather than slotted in next to X, so a mask already written to an INI keeps
-	// meaning what it meant.
+	// meaning what it meant. Everything below follows the same rule: append only.
 	TextureOffsetY,
+	PreloadFrameData,
+	DisablePartialInvalidation,
 	MaxCount
 };
 
@@ -964,6 +985,9 @@ struct Pcsx2Config
 		GSPostBilinearMode LinearPresent = DEFAULT_BILINEAR_FILTERING_MODE;
 
 		float StretchY = 100.0f;
+		/// Width/height for AspectRatioType::Custom. Stored as a ratio, not W and H separately, so
+		/// anything can be expressed (2.1666 for 19.5:9, 1.85 for a film ratio) without a second key.
+		float CustomAspectRatio = 16.0f / 9.0f;
 		int Crop[4] = {};
 
 		float OsdScale = DEFAULT_OSD_SCALE;

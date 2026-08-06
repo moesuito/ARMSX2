@@ -590,6 +590,24 @@ struct ThemePaletteControls: View {
     }
   }
 
+  // Two separate things force the dark gradient to zero in DynamicBackgroundTheme, and the
+  // slider only ever greyed out for the first. The second is the eye button on a saved
+  // palette, which lives in another section and says nothing about this one, so the slider
+  // sat at full strength doing nothing with no way to work out why.
+  private var darkGradientIsInert: Bool {
+    particleSettings.disablesDarkPaletteEffects || sharedCustomColor?.usesDarkEffect == false
+  }
+
+  private var darkGradientInertReason: String? {
+    if particleSettings.disablesDarkPaletteEffects {
+      return "Dark effects on palettes are switched off above."
+    }
+    if sharedCustomColor?.usesDarkEffect == false {
+      return "This saved palette has its dark effect turned off, so the strength is ignored."
+    }
+    return nil
+  }
+
   private var paletteEffectsSection: some View {
     VStack(alignment: .leading, spacing: 12) {
       Toggle(
@@ -602,17 +620,24 @@ struct ThemePaletteControls: View {
         "Dark gradient strength",
         value: $particleSettings.paletteDarkEffectIntensity,
         range: 0...2,
+        step: 0.01,
         formattedValue: "\(Int(particleSettings.paletteDarkEffectIntensity * 100))%",
         resetValue: 1
       )
-      .disabled(particleSettings.disablesDarkPaletteEffects)
-      .opacity(particleSettings.disablesDarkPaletteEffects ? 0.45 : 1)
+      .disabled(darkGradientIsInert)
+      .opacity(darkGradientIsInert ? 0.45 : 1)
+      if let reason = darkGradientInertReason {
+        Text(reason)
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
 
       if target == .shared {
         particleSlider(
           "Palette tilt gradient",
           value: $particleSettings.sharedPaletteGradientTilt,
           range: -180...180,
+          step: 1,
           formattedValue: gradientTiltDescription(
             particleSettings.sharedPaletteGradientTilt
           ),
@@ -623,6 +648,7 @@ struct ThemePaletteControls: View {
           "Y-Axis gradient",
           value: $particleSettings.sharedPaletteGradientOffsetY,
           range: -1...1,
+          step: 0.01,
           formattedValue: gradientOffsetDescription(
             particleSettings.sharedPaletteGradientOffsetY
           ),
@@ -633,6 +659,7 @@ struct ThemePaletteControls: View {
           "X-Axis gradient",
           value: $particleSettings.sharedPaletteGradientOffsetX,
           range: -1...1,
+          step: 0.01,
           formattedValue: gradientOffsetDescription(
             particleSettings.sharedPaletteGradientOffsetX
           ),
@@ -643,6 +670,7 @@ struct ThemePaletteControls: View {
           "Gradient width",
           value: $particleSettings.sharedPaletteGradientWidth,
           range: 0.25...3,
+          step: 0.01,
           formattedValue: String(
             format: "%.2fx",
             particleSettings.sharedPaletteGradientWidth
@@ -654,6 +682,7 @@ struct ThemePaletteControls: View {
           "Gradient curvature",
           value: $particleSettings.sharedPaletteGradientCurvature,
           range: -1...1,
+          step: 0.01,
           formattedValue: gradientOffsetDescription(
             particleSettings.sharedPaletteGradientCurvature
           ),
@@ -743,6 +772,7 @@ struct ThemePaletteControls: View {
     _ title: String,
     value: Binding<Double>,
     range: ClosedRange<Double>,
+    step: Double? = nil,
     formattedValue: String,
     resetValue: Double
   ) -> some View {
@@ -750,7 +780,7 @@ struct ThemePaletteControls: View {
       title: title,
       value: value,
       range: range,
-      step: nil,
+      step: step,
       formattedValue: formattedValue,
       resetValue: resetValue
     )
@@ -1222,9 +1252,11 @@ struct ThemePaletteEditor: View {
       .opacity(1 - backgroundPreviewOpacity)
       .allowsHitTesting(!isShowingBackgroundOnly || activeSliderTitle != nil)
       .environment(
-        \.dynamicSettingsSliderActivity,
-        DynamicSettingsSliderActivity(update: updateSliderActivity)
+        \.numberRowActivity,
+        NumberRowActivity(update: updateSliderActivity)
       )
+      // The editor packs a few hundred rows into a sheet; Form metrics would double its height.
+      .numberRowStyle(.compact)
     )
   }
 
@@ -1620,37 +1652,12 @@ struct ThemePaletteEditor: View {
     recordEditorChange()
     guard oldSnapshot.visualState != newSnapshot.visualState else { return }
 
-    if isOnlyPortraitWideningChange(from: oldSnapshot, to: newSnapshot)
-      || isOnlyBackgroundPreviewTimingChange(from: oldSnapshot, to: newSnapshot)
-    {
+    if isOnlyBackgroundPreviewTimingChange(from: oldSnapshot, to: newSnapshot) {
       lastThemeSnapshot = currentTheme
       return
     }
 
     scheduleBackgroundPreview()
-  }
-
-  private func isOnlyPortraitWideningChange(
-    from oldSnapshot: ThemePaletteEditorSnapshot,
-    to newSnapshot: ThemePaletteEditorSnapshot
-  ) -> Bool {
-    guard
-      oldSnapshot.sharedPalette == newSnapshot.sharedPalette,
-      oldSnapshot.sharedCustomColor == newSnapshot.sharedCustomColor,
-      oldSnapshot.sharedMultiColor == newSnapshot.sharedMultiColor,
-      oldSnapshot.ribbonPalette == newSnapshot.ribbonPalette,
-      oldSnapshot.ribbonCustomColor == newSnapshot.ribbonCustomColor,
-      oldSnapshot.ribbonMultiColor == newSnapshot.ribbonMultiColor,
-      oldSnapshot.particleSettings.widensPortraitBackground
-        != newSnapshot.particleSettings.widensPortraitBackground
-    else {
-      return false
-    }
-
-    var normalizedSettings = oldSnapshot.particleSettings
-    normalizedSettings.widensPortraitBackground =
-      newSnapshot.particleSettings.widensPortraitBackground
-    return normalizedSettings == newSnapshot.particleSettings
   }
 
   private func isOnlyBackgroundPreviewTimingChange(
@@ -1746,7 +1753,13 @@ struct ThemePaletteEditor: View {
     applyEditorSnapshot(snapshot)
   }
 
-  private func applyEditorSnapshot(_ snapshot: ThemePaletteEditorSnapshot) {
+  // restoringSavedColors is false only for Cancel. Undo and redo do want the swatch list
+  // to move with everything else; Cancel does not, because saving a swatch is its own
+  // deliberate act and rolling it back reads as losing work.
+  private func applyEditorSnapshot(
+    _ snapshot: ThemePaletteEditorSnapshot,
+    restoringSavedColors: Bool = true
+  ) {
     pendingUndoSnapshot = nil
     sharedPalette = snapshot.sharedPalette
     sharedCustomColor = snapshot.sharedCustomColor
@@ -1756,7 +1769,9 @@ struct ThemePaletteEditor: View {
     ribbonMultiColor = snapshot.ribbonMultiColor
     particleSettings = snapshot.particleSettings
     isPlayStation3XMBPresetExplicit = snapshot.isPlayStation3XMBPresetExplicit
-    savedColorsJSON = snapshot.savedColorsJSON
+    if restoringSavedColors {
+      savedColorsJSON = snapshot.savedColorsJSON
+    }
     lastEditorSnapshot = snapshot
   }
 
@@ -1776,7 +1791,11 @@ struct ThemePaletteEditor: View {
     isClosingEditor = true
     endBackgroundPreview()
     if let initialEditorSnapshot {
-      applyEditorSnapshot(initialEditorSnapshot)
+      applyEditorSnapshot(initialEditorSnapshot, restoringSavedColors: false)
+      // Restoring the bindings is not enough. Saving a swatch mid session calls
+      // onSaveAppearance, which persists the whole preferences struct, so everything
+      // edited before that point is already committed and would outlive Cancel.
+      onSaveAppearance()
     }
     dismiss()
   }

@@ -30,6 +30,8 @@ namespace Interp = R5900::Interpreter::OpcodeImpl::COP1;
 #define FPUflagC  0x00800000
 #define FPUflagI  0x00020000
 #define FPUflagD  0x00010000
+#define FPUflagO  0x00008000
+#define FPUflagU  0x00004000
 #define FPUflagSI 0x00000040
 #define FPUflagSD 0x00000020
 
@@ -72,9 +74,10 @@ void recCFC1()
 	if (_Fs_ >= 16)
 	{
 		// FCR31: mask out always-zero bits, set always-one bits (x86 recCFC1
-		// shape; the interpreter returns the raw word — JIT-side fixed-bit
-		// emulation is an x86-parity divergence by design, pinned by
-		// EeRecFpu.CompareThenCfc1SeesFreshConditionBit).
+		// shape; the interpreter's CFC1 applies the same model, so this is
+		// not a divergence — pinned by
+		// EeRecFpu.CompareThenCfc1SeesFreshConditionBit and
+		// EeFpuFcrConsoleConformance.BothEnginesMatchConsoleFcrModel).
 		const int fl = fpuTryAllocFCR31(MODE_READ);
 		if (fl >= 0)
 			armAsm->And(RWSCRATCH, armWRegister(fl), 0x0083c078);
@@ -351,15 +354,61 @@ static void fpuClampResult(const a64::VRegister& fpr)
 	armAsm->Fmaxnm(fpr, fpr, a64::s9);
 }
 
-// One-sided positive clamp for results that are statically non-negative
-// (ABS.S). Fabs clears the sign bit, so the value is always >= 0 (NaN ->
-// +0x7FFFFFFF), which makes the lower Fmaxnm(-FLT_MAX) of fpuClampResult dead.
-// Like x86 recABS_S_xmm, only the positive clamp is needed (the ABS result is
-// never negative), so only one Fminnm vs 0x7f7fffff is emitted.
-// Saves one NEON insn per ABS.S.
-static void fpuClampResultPositive(const a64::VRegister& fpr)
+// This file used to carry two more clamp helpers, both now deleted along with
+// their only callers:
+//
+//   fpuClampOperandPositive — an integer Umin against +fMax, for SQRT.S's
+//     post-Fabs operand. recSQRT_S_xmm scales by a power of two instead.
+//   fpuClampResultPositive — a one-sided Fminnm against +fMax, for ABS.S.
+//     recABS_S_xmm emits nothing but the Fabs now.
+//
+// All three removals are the same finding: exponent 255 is an ORDINARY binade
+// on the EE, so clamping those patterns to +fMax is not saturation, it is
+// corruption. Both interpreters and the console pass them through untouched.
+// See EeFpuAbsNegClamp and EeFpuOverflowConsole.SqrtMatchesConsoleOnEvery*.
+
+// Clear the O and U cause flags.
+//
+// This is a whole-family obligation, not an ABS/NEG one. The EE clears the two
+// CAUSE bits (the sticky SO/SU survive) on every op that can raise them: the
+// ten raiseOrClearOU ops in FPU.cpp — ADD, SUB, MUL and the A-forms, plus the
+// four multiply-accumulates — and MAX/MIN/ABS/NEG, which clearFPUFlags(O|U)
+// and do nothing else. DIV, SQRT, RSQRT, MOV, CVT and the compares must leave
+// both alone, and do not call this.
+//
+// The fast path cleared none of them, so an O or U raised by an earlier
+// instruction stayed visible to the next cfc1 for the rest of the block.
+// Measured against silicon on the FCR31-seeded capture rows: ABS, NEG, ADD,
+// ADDA, MADD, MSUB, MUL, MULA, MAX and MIN all read back 0x0183C079 where the
+// console gives 0x01830079. SUB, SUBA, MADDA and MSUBA have no seeded row and
+// are fixed on the interpreter's authority alone (raiseOrClearOU clears both
+// causes on every one of the ten). x86 iFPU.cpp has the identical defect —
+// the same line is commented out at 13 sites.
+//
+// It goes FIRST in each emitter, before the op writes anything. The fast path
+// raises neither flag today so the order is not yet observable, but the
+// interpreter and the FULL path both clear-then-set, and an emitter that
+// learns to raise O must not have its flag wiped by a clear placed after it.
+//
+// The clear is free; RAISING O/U is not, and that asymmetry is the tier line.
+// A correct raise needs the exact magnitude of the result, which a saturating
+// single cannot carry — see ToPS2FPU_Full (iFPUd-arm64.cpp), which gets it
+// only because fpuFullMode already pays for double arithmetic.
+//
+// Pinned by EeFpuAbsNegClamp.AbsAndNegClearOverflowFlags and
+// EeFpuFcrConsoleConformance.EnginesAgreeOnTheOverflowFlagClear.
+//
+// GE-12: honour a register-allocated FCR31 rather than going through memory,
+// same shape as recSQRT_S_xmm's flag RMW.
+static void fpuClearOUFlags()
 {
-	armAsm->Fminnm(fpr, fpr, a64::s8);
+	const int fl = fpuTryAllocFCR31(MODE_READ | MODE_WRITE);
+	const a64::Register flagReg = (fl >= 0) ? armWRegister(fl) : RWSCRATCH;
+	if (fl < 0)
+		armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
+	armAsm->Bic(flagReg, flagReg, FPUflagO | FPUflagU);
+	if (fl < 0)
+		armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
 }
 
 // Sign-preserving operand clamp for FPU comparisons (C.cond.S).
@@ -402,26 +451,6 @@ static void fpuClampCompareOperand(const a64::VRegister& s)
 static a64::VRegister fpuClampInput(const a64::VRegister& src, const a64::VRegister& scratch)
 {
 	if (!CHECK_FPU_EXTRA_OVERFLOW)
-		return src;
-	armAsm->Fmov(scratch, src);
-	fpuClampCompareOperand(scratch);
-	return scratch;
-}
-
-// Source-operand clamp for MAX.S / MIN.S. Identical sign-preserving inf/NaN ->
-// ±fMax to fpuClampInput, but gated on CHECK_FPU_OVERFLOW (eeClampMode >= 1)
-// instead of CHECK_FPU_EXTRA_OVERFLOW (>= 2). x86 routes MAX/MIN through
-// recCommutativeOp with op>=2, whose gate `CHECK_FPU_EXTRA_OVERFLOW || (op>=2)`
-// is always true, so it fpuFloat2-clamps both operands whenever CHECK_FPU_OVERFLOW
-// — a strictly lower threshold than the arithmetic ops. AetherSX2's shipped arm64
-// rec gates the same MAX/MIN clamp on fpuOverflow (options bit 8) vs ADD/SUB's
-// bit 8+9 (verified by disassembly of the 3606 build). Without it a raw Inf/NaN
-// operand (via MOV.S/LWC1/MTC1) survives the NaN-eating Fmaxnm/Fminnm as the
-// wrong finite value — the True Crime: New York City rainbow. Off (mode 0)
-// returns the source reg and emits nothing.
-static a64::VRegister fpuClampMinMaxOperand(const a64::VRegister& src, const a64::VRegister& scratch)
-{
-	if (!CHECK_FPU_OVERFLOW)
 		return src;
 	armAsm->Fmov(scratch, src);
 	fpuClampCompareOperand(scratch);
@@ -592,12 +621,24 @@ static void fpuEmitGuardedAddSub(const a64::VRegister& dst,
 
 // FpuMulHack (Tales of Destiny Remake gamefix, EmuConfig.Gamefixes.FpuMulHack).
 // x86 routes every FPU multiply (MUL/MULA/MADD/MSUB) through FPU_MUL, which —
-// when the gamefix is on — patches the single specific product 0.25 * (π/2)
-// (0x3e800000 * 0x40490fdb) to 0x3f490fda so the game stops hanging in one
-// late-game room. Emit `dst = (hit) ? 0x3f490fda : s*t`; callers clamp/accumulate
-// dst as they normally would (the magic value is an ordinary small float, so a
-// following fpuClampResult is a no-op). In the default config (gamefix off) this
-// is a bare Fmul — zero added cost.
+// when the gamefix is on — patches the single specific product 0.25 * π
+// (0x3e800000 * 0x40490fdb) from the correctly-rounded 0x3f490fdb to 0x3f490fda
+// so the game stops hanging in one late-game room. Emit
+// `dst = (hit) ? 0x3f490fda : s*t`; callers clamp/accumulate dst as they normally
+// would (the magic value is an ordinary small float, so a following
+// fpuClampResult is a no-op). In the default config (gamefix off) this is a bare
+// Fmul — zero added cost.
+//
+// The patched value is not arbitrary: 0x3f490fda is π/4 one ULP low, which is
+// what the EE's multiplier actually returns. Its Booth recoding drops one ULP
+// when ft's significand has an odd digit pair (ft & 0x2AA) and the exact product
+// has no tail below the single ULP — here fs = 2^-2, so the product is exact and
+// the deficit reaches the result. The general model reproduces this pair (and
+// leaves the swapped operand order alone, exactly as the check below does).
+// It is NOT generalized here: in this fast path it costs ~9 instructions on every
+// multiply in every game, against 1 today. Its home is iFPUd-arm64.cpp, where the
+// double product already exists and it costs 4 — extending it to this path needs
+// its own measured case.
 static void emitFpuMul(const a64::VRegister& dst, const a64::VRegister& s, const a64::VRegister& t)
 {
 	if (!CHECK_FPUMULHACK)
@@ -671,11 +712,29 @@ void recMOV_S()
 		XMMINFO_WRITED | XMMINFO_READS);
 }
 
+// ABS.S / NEG.S are raw sign-bit operations on the EE — the interpreter does
+// `& 0x7fffffff` / `^ 0x80000000` and the console agrees on every operand,
+// including exponent-255 patterns and denormals. Neither clamps.
+//
+// The fast path used to clamp both to ±fMax, which corrupted 22 of the 54
+// ABS/NEG operands in the first-party capture, in two ways:
+//
+//   * exponent-255 in, +fMax out. Those are ordinary large PS2 floats, not
+//     infinities — abs(0x7F800000) is 0x7F800000, not 0x7F7FFFFF.
+//   * denormal in, ZERO out, on ABS only. The clamp was an Fminnm, an
+//     ARITHMETIC op, so FPCR.FZ flushed the operand before the compare even
+//     happened. NEG's clamp was an integer Smin/Umin and so never did this,
+//     which is exactly why only ABS lost its denormals.
+//
+// Fabs and Fneg alone are correct and total. They are non-arithmetic bit
+// operations on AArch64 — no exceptions, no flush, NaN payloads through with
+// only the sign changed — so they match x86's AND/XOR-with-mask and the
+// interpreter's bit ops exactly. Same code the FULL path has always emitted
+// (DOUBLE::recABS_S_xmm / recNEG_S_xmm, iFPUd-arm64.cpp).
 static void recABS_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	armAsm->Fabs(armSRegister(EEREC_D), armSRegister(EEREC_S));
-	// ABS output is always non-negative -> one-sided positive clamp.
-	fpuClampResultPositive(armSRegister(EEREC_D));
 }
 
 void recABS_S()
@@ -684,13 +743,14 @@ void recABS_S()
 		XMMINFO_WRITED | XMMINFO_READS);
 }
 
+// See recABS_S_xmm above. The clamp deleted from here was the sign-preserving
+// integer one (mirroring x86's switch from ClampValues to fpuFloat3, upstream
+// 4ffbe0bbf) — which fixed NEG.S folding -NaN to +fMax, but kept the underlying
+// mistake of clamping at all. The console does not.
 static void recNEG_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	armAsm->Fneg(armSRegister(EEREC_D), armSRegister(EEREC_S));
-	// Sign-preserving clamp: NEG.S of a poisoned +NaN/-Inf must keep the sign
-	// (-> -fMax), but fpuClampResult (Fminnm/Fmaxnm) folds every NaN to +fMax.
-	// Mirrors x86's switch from ClampValues to fpuFloat3 (upstream 4ffbe0bbf).
-	fpuClampCompareOperand(armSRegister(EEREC_D));
 }
 
 void recNEG_S()
@@ -796,6 +856,7 @@ void recC_LE()
 
 static void recADD_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	fpuEmitGuardedAddSub(armSRegister(EEREC_D), s, t, false);
@@ -810,6 +871,7 @@ void recADD_S()
 
 static void recSUB_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	fpuEmitGuardedAddSub(armSRegister(EEREC_D), s, t, true);
@@ -824,6 +886,7 @@ void recSUB_S()
 
 static void recMUL_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(armSRegister(EEREC_D), s, t);
@@ -963,10 +1026,15 @@ static void recSQRT_S_xmm(int info)
 		emitLoadFPCR(EmuConfig.Cpu.FPUDivFPCR.bitmask);
 
 	// PS2 SQRT.S flag handling (interp SQRT_S, FPU.cpp; CHECK_FPU_EXTRA_FLAGS
-	// is always on): clear I|D unconditionally, then set I|SI when Ft is a
-	// negative *non-zero* value (exp field nonzero AND sign bit set). The
-	// ±0 / denormal-as-zero case (exp field == 0) sets no flag. Read the Ft
-	// bits before Fabs clobbers EEREC_D, which may alias EEREC_T.
+	// is always on): clear I|D unconditionally, then set I|SI whenever Ft's
+	// SIGN BIT is set. The exponent field plays no part — −0 and the negative
+	// denormals raise I|SI too, even though they flush to −0 and produce +0.
+	// This used to carry an extra `exp != 0` gate, which cost exactly those two
+	// operand classes their flag; x86's recSQRT_S_xmm (iFPU.cpp, MOVMSKPS & 1)
+	// and the FULL-mode DOUBLE path (iFPUd-arm64.cpp) have always tested the
+	// sign alone. Scored against a first-party capture over the sign × exponent
+	// matrix — see EeRecFpu.SqrtSInvalidFlagFollowsTheSignBitAlone.
+	// Read the Ft bits before Fabs clobbers EEREC_D, which may alias EEREC_T.
 	// GE-12: flag RMW on the resident FCR31; alloc first (eviction stores
 	// must precede the RWARG1 clobber and the branch arms). GE-20 gave SQRT
 	// a DOUBLE:: variant, so this body no longer runs under FULL mode; the
@@ -978,8 +1046,6 @@ static void recSQRT_S_xmm(int info)
 		armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
 	armAsm->Bic(flagReg, flagReg, FPUflagI | FPUflagD);
 	a64::Label skipFlag;
-	armAsm->Tst(RWARG1, 0x7F800000);                 // exp field
-	armAsm->B(&skipFlag, a64::eq);                    // ±0/denorm → no flag
 	armAsm->Tbz(RWARG1, 31, &skipFlag);              // positive → no flag
 	armAsm->Orr(flagReg, flagReg, FPUflagI | FPUflagSI);
 	armAsm->Bind(&skipFlag);
@@ -988,8 +1054,67 @@ static void recSQRT_S_xmm(int info)
 
 	// PS2 takes sqrt of |ft| → Fabs first.
 	armAsm->Fabs(armSRegister(EEREC_D), ft);
-	armAsm->Fsqrt(armSRegister(EEREC_D), armSRegister(EEREC_D));
-	fpuClampResult(armSRegister(EEREC_D));
+
+	// Exponent-255 operands. On the EE that is an ORDINARY binade — no Inf, no
+	// NaN, and the representable max is 0x7FFFFFFF, not FLT_MAX — but the host
+	// reads those patterns as Inf/NaN, so a plain Fsqrt returns Inf/NaN and
+	// fpuClampResult flattens it to +fMax. This used to be papered over with a
+	// source-operand clamp down to +fMax (an integer Umin, gated on
+	// CHECK_FPU_OVERFLOW, mirroring x86's `xMIN.SS(EEREC_D, g_maxvals[0])` at
+	// iFPU.cpp:1777, itself mirroring the interpreter's fpuDouble). That put
+	// interp, x86 and arm64 on ONE answer, which is a weaker property than the
+	// RIGHT answer: all three landed two binades below the console —
+	// sqrt(0x7F800000) = 0x5F7FFFFF against silicon's 0x5F800000, and
+	// sqrt(0x7FFFFFFF) = 0x5F7FFFFF against 0x5FB504F3.
+	//
+	// Instead, square-root |Ft|/4 and double it. sqrt halves exponents, so the
+	// scaled operand (exponent field 253) and the doubled result are both
+	// ordinary singles — this needs no wider format and so stays on the fast
+	// path, which is single-precision by design. 4 is an even power of two, so
+	// its own square root is exact and the identity contributes no rounding of
+	// its own; the Fsqrt is the only rounding step, and Fadd(d,d,d) doubles
+	// exactly in any rounding mode. It is the same power-of-two prescale
+	// ToDouble() uses to carry these operands into FULL mode (iFPUd-arm64.cpp),
+	// with the factor picked to suit sqrt.
+	//
+	// Ungated on purpose. The old clamp fired only on exponent-255 patterns
+	// (over non-negative floats the unsigned integer order IS the IEEE order,
+	// so everything at or below 0x7F7FFFFF passed through untouched), and with
+	// it off the same operands came out at 0x7F7FFFFF instead — wrong in every
+	// clamp mode, just differently wrong. So this branch replaces it in all of
+	// them and moves nothing else: exponent <= 254 still takes the plain Fsqrt.
+	//
+	// It also sidesteps the host NaN taxonomy entirely, which is what made the
+	// clamp delicate: Fminnm is not MINSS (MINSS returns src2 for ANY NaN,
+	// FMINNM only prefers the number against a QUIET one), so the clamp had to
+	// be an integer Umin to cover the 4194303 signalling patterns that are just
+	// ordinary large floats to the EE. Testing the exponent field, as the
+	// interpreter's fpuDouble does, never asks the question.
+	// Pinned by EeFpuOverflowConsole.SqrtMatchesConsoleOnEveryExponent255Operand.
+	{
+		const a64::VRegister d = armSRegister(EEREC_D);
+		a64::Label ordinary, sqrtDone;
+
+		armAsm->Fmov(RWSCRATCH, d);
+		armAsm->And(RWARG1, RWSCRATCH, 0x7f800000);
+		armAsm->Cmp(RWARG1, 0x7f800000);
+		armAsm->B(&ordinary, a64::ne);
+
+		// |Ft| / 4: lower the exponent field by two. 0x01000000 is not an
+		// add/sub immediate (0x1000 needs 13 bits), so it goes in two steps.
+		armAsm->Sub(RWSCRATCH, RWSCRATCH, 0x00800000);
+		armAsm->Sub(RWSCRATCH, RWSCRATCH, 0x00800000);
+		armAsm->Fmov(d, RWSCRATCH);
+		armAsm->Fsqrt(d, d);
+		armAsm->Fadd(d, d, d);                       // *2, exact
+		armAsm->B(&sqrtDone);
+
+		armAsm->Bind(&ordinary);
+		armAsm->Fsqrt(d, d);
+
+		armAsm->Bind(&sqrtDone);
+		fpuClampResult(d);
+	}
 
 	if (swapFpcr)
 		emitLoadFPCR(EmuConfig.Cpu.FPUFPCR.bitmask);
@@ -1039,13 +1164,26 @@ static void recRSQRT_S_xmm(int info)
 	armAsm->Tst(RWARG1, 0x7F800000);
 	armAsm->B(&notZero, a64::ne);
 
-	// Zero divisor: set D|SD; result = sign(Ft) | 0x7f7fffff.
+	// Zero divisor: set D|SD; result = sign(FS) | 0x7f7fffff.
+	//
+	// FS, not FT. This op divides by sqrt(|Ft|), so by the time the division
+	// happens the divisor has no sign left to contribute -- only the dividend
+	// does. This emitter used Ft's sign and was alone in doing so: x86
+	// recRSQRThelper1 (iFPU.cpp) takes Fs's, and so does the console.
+	// rsqrt(+0, -0) is the row that separates them, and it is in the capture --
+	// console +0x7FFFFFFF, upstream x86 JIT +0x7F7FFFFF, this emitter
+	// -0x7F7FFFFF. Pinned by EeRecFpuRsqrt.ZeroDivisorSignComesFromTheDividend.
+	//
+	// The MAGNITUDE stays at FLT_MAX rather than the console's 0x7FFFFFFF: this
+	// tier saturates in host singles throughout and cannot hold the EE's top
+	// binade. That is the standing fast-path compromise, not this fix.
 	armLoadEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
 	armAsm->Orr(RWSCRATCH, RWSCRATCH, FPUflagD | FPUflagSD);
 	armStoreEERegPtr(RWSCRATCH, &fpuRegs.fprc[31]);
-	armAsm->And(RWARG1, RWARG1, 0x80000000);
-	armAsm->Orr(RWARG1, RWARG1, 0x7f7fffff);
-	armAsm->Fmov(armSRegister(EEREC_D), RWARG1);
+	armAsm->Fmov(RWARG2, armSRegister(dreg)); // raw Fs bits, saved before any write
+	armAsm->And(RWARG2, RWARG2, 0x80000000);
+	armAsm->Orr(RWARG2, RWARG2, 0x7f7fffff);
+	armAsm->Fmov(armSRegister(EEREC_D), RWARG2);
 	armAsm->B(&end);
 
 	armAsm->Bind(&notZero);
@@ -1089,31 +1227,76 @@ void recRSQRT_S()
 		XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
 }
 
-// PS2 FPU has no NaN concept. At eeClampMode >= 1 the operands are first
-// clamped to ±fMax (sign-preserving, via fpuClampMinMaxOperand — matching x86
-// recCommutativeOp's always-firing op>=2 clamp and AetherSX2's arm64 rec), so a
-// raw Inf/NaN operand cannot reach the max/min. The result never needs clamping
-// (max/min of two finite ±fMax-bounded inputs stays in range). Fmaxnm/Fminnm
-// (not Fmax/Fmin, which IEEE-propagate NaN) give MAXSS/MINSS NaN-eating for the
-// unclamped mode-0 case.
-static void recMAX_S_xmm(int info)
+// MAX.S / MIN.S are bit SELECTION, not arithmetic. The console orders the two
+// raw words by (sign, magnitude) and writes the winner's word through
+// unchanged — that is `fp_max`/`fp_min` in FPU.cpp, a pure integer compare, and
+// it is exactly what the DOUBLE tier already does (DOUBLE::recMINMAX, the port
+// of x86 iFPUd.cpp recMINMAX: "FPU's MAX/MIN work with all numbers (including
+// denormals)"). Because there is no arithmetic in the op, the single/double
+// split has nothing to say about it and both tiers owe the same answer.
+//
+// The fast path used to compute it with Fmaxnm/Fminnm over ±fMax-clamped
+// operands (the x86 iFPU.cpp fast tier still does, via recCommutativeOp op>=2).
+// Two whole operand classes come back wrong that way, and both are visible in
+// the SCPH-90000 capture — 38 of 66 MAX cases and 16 of 66 MIN cases:
+//
+//   denormals   Fmaxnm/Fminnm are arithmetic, so FPCR.FZ flushes the operand
+//               and the winner's word is lost: max(0x00000001, 0) reads back
+//               0x00000000 where the console says 0x00000001. (30 MAX, 14 MIN.)
+//   exponent255 the ±fMax operand clamp folds every top-binade word onto
+//               0x7F7FFFFF: max(0x7F7FFFFF, 0x7FFFFFFF) reads back 0x7F7FFFFF
+//               where the console says 0x7FFFFFFF. Exponent 255 is an ordinary
+//               binade on the EE and 0x7FFFFFFF is the largest number there is
+//               — the same defect ABS.S/NEG.S carried until cbf04acba1.
+//               (8 MAX, 2 MIN.)
+//
+// Dropping the clamp does not reopen the True Crime: New York City rainbow that
+// motivated it (a raw Inf/NaN operand being eaten by Fmaxnm and losing to the
+// small operand): the integer ordering has no NaN concept to eat, so a
+// pseudo-inf operand wins the max as the huge number the console treats it as.
+//
+// Ordering key: k(x) = x ^ ((x >>s 31) >>u 1) flips the low 31 bits of a
+// negative word and leaves a positive one alone, so a SIGNED compare of the
+// keys is the console's total order. It is an involution, but there is no need
+// to invert it — Csel picks between the untouched originals.
+//
+// ⚠️ Same GPR scratch contract as fpuEmitGuardedAddSub: w0/w1/w8 and the
+// non-allocatable w9 only. Never x2-x7/x14/x15, where a resident FCR31 lives.
+// fpuClearOUFlags() runs first, so any allocator eviction it emits lands before
+// the raw scratch goes live.
+static void recMINMAX(int info, bool ismin)
 {
-	const a64::VRegister s = fpuClampMinMaxOperand(armSRegister(EEREC_S), RSSCRATCH);
-	const a64::VRegister t = fpuClampMinMaxOperand(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fmaxnm(armSRegister(EEREC_D), s, t);
+	fpuClearOUFlags();
+
+	const a64::Register sbits = RWARG1, tbits = RWARG2;
+	const a64::Register skey = RWSCRATCH, tkey = a64::w9;
+
+	armAsm->Fmov(sbits, armSRegister(EEREC_S));
+	armAsm->Fmov(tbits, armSRegister(EEREC_T));
+	armAsm->Asr(skey, sbits, 31);
+	armAsm->Eor(skey, sbits, a64::Operand(skey, a64::LSR, 1));
+	armAsm->Asr(tkey, tbits, 31);
+	armAsm->Eor(tkey, tbits, a64::Operand(tkey, a64::LSR, 1));
+	armAsm->Cmp(skey, tkey);
+	// Equal keys mean identical words, so either arm is correct there.
+	armAsm->Csel(sbits, sbits, tbits, ismin ? a64::le : a64::ge);
+	armAsm->Fmov(armSRegister(EEREC_D), sbits);
 }
 
+static void recMAX_S_xmm(int info) { recMINMAX(info, false); }
+static void recMIN_S_xmm(int info) { recMINMAX(info, true); }
+
+// FULL mode keeps dispatching to DOUBLE::recMINMAX rather than sharing this
+// body. The two are semantically identical (both are fp_max/fp_min) and the
+// capture scores the DOUBLE one 66/66 on both ops in all 1024 grid cells, so
+// there is nothing to gain by moving it — and the tiers deliberately differ on
+// FCR31 residency: fpuTryAllocFCR31 returns -1 under CHECK_FPU_FULL because the
+// DOUBLE bodies RMW fprc[31] through memory (GE-12 comment at the top of this
+// file). Keeping the split keeps that invariant local to each tier.
 void recMAX_S()
 {
 	eeFPURecompileCode(CHECK_FPU_FULL ? DOUBLE::recMAX_S_xmm : recMAX_S_xmm, Interp::MAX_S,
 		XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
-}
-
-static void recMIN_S_xmm(int info)
-{
-	const a64::VRegister s = fpuClampMinMaxOperand(armSRegister(EEREC_S), RSSCRATCH);
-	const a64::VRegister t = fpuClampMinMaxOperand(armSRegister(EEREC_T), RSSCRATCH2);
-	armAsm->Fminnm(armSRegister(EEREC_D), s, t);
 }
 
 void recMIN_S()
@@ -1128,6 +1311,7 @@ void recMIN_S()
 
 static void recADDA_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), s, t, false);
@@ -1142,6 +1326,7 @@ void recADDA_S()
 
 static void recSUBA_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	fpuEmitGuardedAddSub(armSRegister(EEREC_ACC), s, t, true);
@@ -1156,6 +1341,7 @@ void recSUBA_S()
 
 static void recMULA_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(armSRegister(EEREC_ACC), s, t);
@@ -1173,6 +1359,7 @@ void recMULA_S()
 // for the intermediate product — leaves EEREC_S/T allocator-resident.
 static void recMADD_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(RSSCRATCH, s, t);
@@ -1201,6 +1388,7 @@ void recMADD_S()
 // fd = ACC - fs * ft
 static void recMSUB_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(RSSCRATCH, s, t);
@@ -1227,6 +1415,7 @@ void recMSUB_S()
 // the other way by never clamping the A-form product).
 static void recMADDA_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(RSSCRATCH, s, t);
@@ -1246,6 +1435,7 @@ void recMADDA_S()
 // extra-gated product clamp for x86-JIT parity (GE-19).
 static void recMSUBA_S_xmm(int info)
 {
+	fpuClearOUFlags();
 	const a64::VRegister s = fpuClampInput(armSRegister(EEREC_S), RSSCRATCH);
 	const a64::VRegister t = fpuClampInput(armSRegister(EEREC_T), RSSCRATCH2);
 	emitFpuMul(RSSCRATCH, s, t);

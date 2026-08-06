@@ -3411,22 +3411,66 @@ bool GSDeviceVK::CheckFeatures()
 	// input attachment and the feedback-loop-layout texelFetch sampler. Reading a separate copy of
 	// the target is the only reliable form.
 	//
-	// ⚠️ Narrowed to replacement textures deliberately. Device A/B on Turnip/Adreno 650:
-	//   - TotA + HD pack, in-tile: text layer gone at 4x AND at 1x (so it is not tile-size related)
-	//   - TotA + HD pack, RT copy: correct
-	//   - NFS Underground, no pack, 608 barrier draws/frame through the same in-tile self-read:
-	//     renders correctly
-	// So the self-read is fine for ordinary blending and only fails when the draw also samples a
-	// replacement. Applying the copy unconditionally cost +38%/+40% frame time at 3x/4x on the
-	// NFSU dump (copies 5 -> 348 per frame, render passes 62 -> 391) for no correctness gain,
-	// which is far too much to charge every Adreno user for a bug none of them can hit without a
-	// texture pack. Pack users pay it and get correct output; everyone else keeps the fast path.
+	// This was originally narrowed to replacement textures, on the evidence that Tales of the
+	// Abyss + an HD pack lost its whole 2D text layer in-tile (at 1x as well as 4x, so not
+	// tile-size related) while NFS Underground pushed 608 barrier draws per frame through the same
+	// in-tile self-read with no pack and rendered correctly. That read the pattern backwards: the
+	// self-read is not reliable for ordinary blending either, it just fails subtly enough there to
+	// look fine. OutRun 2006 has no pack and renders its sea as high-contrast two-tone speckle -
+	// 4.0% of the frame differs from the software renderer by more than 16 levels in-tile, and
+	// 0.13% through the RT copy (Turnip/Adreno 650, water dump, 2026-08-02). Both in-pass shapes
+	// are byte-identical wrong, which is what says driver rather than draw.
 	//
-	// If a title is ever reported losing draws WITHOUT a pack, widen this to unconditional — the
-	// underlying driver defect is not replacement-specific, only our evidence is.
+	// So it applies to every draw on an affected driver now. The cost is real and scales with
+	// upscale - measured on device, RT copy vs in-tile, median frame time over two runs each:
+	//
+	//              1x      3x      4x
+	//   FlatOut 2  +7.5%  +10.5%  +24.6%   (copies/frame 23 -> 477, render passes 100 -> 538)
+	//   OutRun    +20.5%   +9.9%   +0.5%
+	//   GoW II     -3.2%   +2.9%
+	//   RG lamps   -1.5%   +9.3%
+	//
+	// The old note recorded +38%/+40% at 3x/4x on NFSU. Nothing here reproduces that on the titles
+	// available now; FlatOut 2 makes a bigger structural change (more copies, more render passes)
+	// for a third of the cost at 3x. Treat the old figure as an upper bound on a build we can no
+	// longer run, not as a contradiction.
+	//
+	// WHICH draws does it get wrong? All of them, on every affected title, and worse than it
+	// looks. Scored per frame against the software renderer, in-tile (Turnip/Adreno 650,
+	// 2026-08-02):
+	//
+	//   FlatOut 2   31.3% of the frame wrong by >16 levels   <- worst measured, once read as clean
+	//   Katamari     7.5%
+	//   OutRun       4.6%   (a separate scoring run from the 4.0% above, different frames)
+	//   NFSU         0.00% by >16 levels, but ~40% of pixels off by 1-16
+	//
+	// NFSU is the whole lesson: corrupt everywhere and invisible, which is exactly what made
+	// "only titles with a texture pack" look like a real gate. There is no title-level
+	// discriminator to find. Nor a useful draw-level one - most corrupted draws never sample the
+	// target, they read it for the destination-alpha test and the write mask, so "self-read"
+	// understates what the workaround protects.
+	//
+	// Two distinct mechanisms, and only one of them is about ordering between draws:
+	//
+	//   1. An in-pass read does not observe writes made by EARLIER DRAWS in the same render
+	//      pass. Ending the pass before such a draw - read still in-pass, no copy - makes
+	//      OutRun, FlatOut, Katamari and NFSU pixel-identical to the copy path.
+	//   2. God of War II is not fixed by a pass boundary, and the oracle says the copy is the
+	//      correct one. Its first failing draw is a 10740-primitive overlapping triangle strip
+	//      whose own primitives read what their predecessors wrote - a hazard inside a single
+	//      draw, which no pass boundary can separate.
+	//
+	// The driver also ignores the in-pass barrier outright: forcing the explicit
+	// vkCmdPipelineBarrier self-dependency path, with the barrier landing on exactly the affected
+	// draws, produces byte-identical wrong output to the coherent ROAA read.
+	//
+	// So the pass boundary is a partial fix rather than a cheaper one - it leaves mechanism 2
+	// broken, and it would re-admit full-barrier draws this driver cannot order. It did measure
+	// ~7% faster than the copy on FlatOut at 1x, and no different on OutRun. Correctness for
+	// everyone beats speed for everyone, and OverrideTextureBarriers = 1 is the documented way
+	// out for anyone who would rather have the frames.
 	const bool rt_self_read_is_broken =
-		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback) &&
-		GSConfig.LoadTextureReplacements;
+		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback);
 
 	// framebuffer_fetch: the tiler-native ordered Cd read (ROAA / subpassLoad in tile
 	// memory). It lets DetermineBarriers() (GSRendererHW.cpp) drop every per-primitive
@@ -3521,7 +3565,17 @@ bool GSDeviceVK::CheckFeatures()
 	// — a new vendor with working ROAA gets the fast path instead of being stranded until someone
 	// adds it to a list. If a non-Mali/non-Adreno vendor is ever REPORTED returning stale/empty
 	// ROAA, add it alongside is_xclipse_vk rather than re-narrowing this.
-	const bool vendor_allows_fbfetch = !unreliable_mali_fbfetch &&
+	// 8 Elite (Adreno 8xx on the Qualcomm PROPRIETARY driver): that blob returns STALE ROAA reads
+	// above Basic blending — invisible floors / alpha cutouts (A/B 2026-06-10, the "Adreno-840
+	// proprietary" case in the note above). Never reproduced on 6xx/7xx or on Turnip/Mesa. So keep
+	// the fast in-tile fbfetch path for every other Adreno, but route the 8xx proprietary blob onto
+	// the correct texture-barrier path — restoring the historical 8-Elite exclusion. A hard gate like
+	// is_xclipse_vk (the toggle can't force it back on), since it's a correctness bug, not a perf
+	// trade; Turnip on 8xx (open driver, no stale reads) is unaffected and keeps the fast path.
+	const bool is_adreno8xx_proprietary = is_adreno &&
+		m_device_driver_properties.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+		mobile_profile.gpu.architecture == MobileGpuArchitecture::Adreno8xx;
+	const bool vendor_allows_fbfetch = !unreliable_mali_fbfetch && !is_adreno8xx_proprietary &&
 		(is_mali_vk || is_adreno || GSConfig.EnableAdrenoFramebufferFetch) && !is_xclipse_vk;
 	m_features.framebuffer_fetch = vendor_allows_fbfetch &&
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
@@ -3543,8 +3597,8 @@ bool GSDeviceVK::CheckFeatures()
 	// revision that fixes the read; an explicit 0 already lands here anyway.
 	if (rt_self_read_is_broken && GSConfig.OverrideTextureBarriers < 0)
 	{
-		Console.WriteLn("VK: texture replacements active on a driver with an unreliable in-pass "
-						"render-target self-read — forcing the RT-copy blend path.");
+		Console.WriteLn("VK: driver has an unreliable in-pass render-target self-read — forcing the "
+						"RT-copy blend path.");
 		m_features.texture_barrier = false;
 	}
 	// Mali r44p1: the attachment-feedback-loop-layout disable in CreateDevice only swapped the
@@ -3759,6 +3813,13 @@ bool GSDeviceVK::CheckFeatures()
 	m_features.dxt_textures = m_device_features.textureCompressionBC;
 	m_features.bptc_textures = m_device_features.textureCompressionBC;
 
+	// The "no stencil buffer or texture barrier" warning is deliberately NOT shown on Android.
+	// UseRenderTargetCopyForFeedback turns texture barriers off by design on the mobile drivers
+	// this ships to (see the feedback notes above), so the condition is the NORMAL configuration
+	// here rather than a fault — every affected user got a scary "this will break some graphical
+	// effects" toast on every boot about a path we chose on purpose. It stays on desktop, where it
+	// really does indicate a deficient driver.
+#ifndef __ANDROID__
 	if (!m_features.texture_barrier && !m_features.stencil_buffer)
 	{
 		Host::AddKeyedOSDMessage("GSDeviceVK_NoTextureBarrierOrStencilBuffer",
@@ -3766,6 +3827,7 @@ bool GSDeviceVK::CheckFeatures()
 				"Stencil buffers and texture barriers are both unavailable, this will break some graphical effects."),
 			Host::OSD_WARNING_DURATION);
 	}
+#endif
 
 	m_max_texture_size = m_device_properties.limits.maxImageDimension2D;
 	m_max_framebuffer_width = m_device_properties.limits.maxFramebufferWidth;
@@ -3930,15 +3992,27 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 			BeginRenderPassForStretchRect(
 				dTexVK, dst_rect, GSVector4i(destX, destY, destX + r.width(), destY + r.height()));
 
-			// so use an attachment clear
+			// so use an attachment clear. VkClearValue is a union, so only the aspect we are
+			// actually clearing may be written -- filling both destroys the colour's red and
+			// green with the depth and the stencil.
 			VkClearAttachment ca;
 			ca.aspectMask = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-			GSVector4::store<false>(ca.clearValue.color.float32, sTexVK->GetClearForFormat());
-			ca.clearValue.depthStencil.depth = sTexVK->GetClearDepth();
-			ca.clearValue.depthStencil.stencil = 0;
 			ca.colorAttachment = 0;
+			if (depth)
+			{
+				ca.clearValue.depthStencil.depth = sTexVK->GetClearDepth();
+				ca.clearValue.depthStencil.stencil = 0;
+			}
+			else
+			{
+				GSVector4::store<false>(ca.clearValue.color.float32, sTexVK->GetClearForFormat());
+			}
 
-			const VkClearRect cr = {{{0, 0}, {static_cast<u32>(r.width()), static_cast<u32>(r.height())}}, 0u, 1u};
+			// The clear rect is in framebuffer coordinates and the framebuffer is the whole
+			// destination, so it has to carry the copy's destination offset.
+			const VkClearRect cr = {{{static_cast<s32>(destX), static_cast<s32>(destY)},
+										{static_cast<u32>(r.width()), static_cast<u32>(r.height())}},
+				0u, 1u};
 			vkCmdClearAttachments(GetCurrentCommandBuffer(), 1, &ca, 1, &cr);
 
 			return;
@@ -6429,6 +6503,23 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 				p.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
 			0);
 	}
+
+	// Declare the feedback loops on the PIPELINE, not just on the image layout and render pass.
+	//
+	// We put attachments into VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (see
+	// UseFeedbackLoopLayout()) but never set the matching pipeline create flags. The spec requires
+	// them on any pipeline used while its attachments are in that layout, so omitting them is
+	// undefined behaviour rather than a missing optimisation — and strict mobile drivers (Adreno)
+	// are exactly where undefined shows up as intermittently stale attachment reads.
+	// Ported from sashkinbro/EmuCoreX ("Fix Vulkan attachment feedback pipelines").
+	if (UseFeedbackLoopLayout())
+	{
+		if (p.IsRTFeedbackLoop())
+			gpb.AddPipelineFlags(VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+		if (p.IsTestingAndSamplingDepth())
+			gpb.AddPipelineFlags(VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+	}
+
 	gpb.SetPrimitiveTopology(topology_lookup[p.topology]);
 	gpb.SetRasterizationState(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
 	if (m_optional_extensions.vk_ext_line_rasterization &&
@@ -6750,7 +6841,7 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartPresent(bool wait_for_completion,
 
 void GSDeviceVK::ExecuteCommandBufferForReadback()
 {
-	m_render_passes_since_readback = 0;
+	m_readback_frame = m_frame;
 	ExecuteCommandBuffer(true);
 	if (m_spinning_supported && GSConfig.HWSpinGPUForReadbacks)
 	{
@@ -7062,8 +7153,6 @@ void GSDeviceVK::EndRenderPass()
 	m_current_render_pass = VK_NULL_HANDLE;
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
 	m_render_passes_since_submit++;
-	if (m_render_passes_since_readback != ~0u)
-		m_render_passes_since_readback++;
 
 	vkCmdEndRenderPass(GetCurrentCommandBuffer());
 }
@@ -7507,19 +7596,29 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	// nothing is staged yet, and every binding below re-applies via dirty flags.
 	// Gated to outside-a-render-pass (no forced tile flush on tilers) and to frames
 	// near an actual readback (games that never read back see zero change).
-	// Threshold is insensitive 4..16 (measured OutRun 2006/SD865); count resets on
-	// every submit, so this adds ~(RPs-per-frame / threshold) extra submits.
+	//
+	// Do not read the threshold as a submit budget. It sets how often we *offer* to kick;
+	// what we get is decided by the fence gate below, and that gate binds by a wide margin.
+	// With three command buffers only two submissions can be in flight, so a third kick
+	// needs the first to have retired. Measured on Rogue Galaxy (M2/Honeykrisp, 60 frames,
+	// ~116 RPs/frame): the arithmetic "RPs-per-frame / threshold" predicts ~14 kicks/frame
+	// and the real number is 2, because ~3300 of ~3400 offers find the next command buffer
+	// still executing. So raising the threshold buys far less than it looks like it should,
+	// and lowering it buys nothing. Sweeping it 8->16 measured -2% total GPU stall on Rogue
+	// Galaxy and +12% on OutRun 2006, i.e. no free lunch in either direction.
 	constexpr u32 kick_threshold = 8;
-	constexpr u32 readback_window = 128; // ~a few frames' worth of render passes
+	constexpr u32 readback_window_frames = 3;
 	// A draw into a recent readback source is (almost certainly) producing the data for
 	// the next readback, which follows immediately — kick regardless of the threshold so
 	// the backlog drains during this pass's recording and the readback waits only on the
 	// pass itself plus the copy (see m_recent_readback_sources).
 	const bool produces_readback_data =
 		config.rt && (config.rt == m_recent_readback_sources[0] || config.rt == m_recent_readback_sources[1]);
-	if ((m_render_passes_since_submit >= kick_threshold ||
+	const bool near_readback = m_readback_frame != ~0u && (m_frame - m_readback_frame) <= readback_window_frames;
+	if (near_readback &&
+		(m_render_passes_since_submit >= kick_threshold ||
 			(produces_readback_data && m_render_passes_since_submit > 0)) &&
-		m_render_passes_since_readback <= readback_window && !InRenderPass())
+		!InRenderPass())
 	{
 		// The kick must never block: submitting cycles to the next command buffer, and
 		// ActivateCommandBuffer fence-waits if that buffer's previous submission is still

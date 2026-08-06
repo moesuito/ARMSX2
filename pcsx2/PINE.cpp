@@ -15,7 +15,10 @@
 #include "VMManager.h"
 #include "vtlb.h"
 #include "common/Error.h"
+#include "common/FPControl.h"
+#include "common/MemorySettingsInterface.h"
 #include "common/SettingsInterface.h"
+#include "common/SettingsWrapper.h"
 #include "common/Threading.h"
 
 #include <atomic>
@@ -172,6 +175,8 @@ namespace PINEServer
 		MsgGetSetting = 0x11, /**< Reads a setting by section/key. */
 		MsgSetSetting = 0x12, /**< Writes a setting by section/key and applies it. */
 		MsgFrameAdvance = 0x13, /**< Advances a paused VM by one frame. */
+		MsgGSDump = 0x14, /**< Records a GS dump of the next N frames. */
+		MsgGetEffectiveSetting = 0x15, /**< Reads what a setting is actually running as. */
 
 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
 	};
@@ -357,6 +362,7 @@ namespace PINEServer
 			"\"frame_ms_avg\":{:.3f},\"frame_ms_min\":{:.3f},\"frame_ms_max\":{:.3f},"
 			"\"cpu_thread_pct\":{:.3f},\"cpu_thread_ms\":{:.3f},"
 			"\"gs_thread_pct\":{:.3f},\"gs_thread_ms\":{:.3f},"
+			"\"gs_back_thread_pct\":{:.3f},\"gs_back_thread_ms\":{:.3f},"
 			"\"vu_thread_pct\":{:.3f},\"vu_thread_ms\":{:.3f},"
 			"\"gpu_pct\":{:.3f},\"gpu_ms_avg\":{:.3f},\"gpu_ms_last\":{:.3f},"
 			"\"gpu_vs_invocations\":{:.0f},\"gpu_ps_invocations\":{:.0f},"
@@ -367,7 +373,7 @@ namespace PINEServer
 			"\"tc_source_hit\":{:.1f},\"tc_source_miss\":{:.1f},"
 			"\"tc_target_hit\":{:.1f},\"tc_target_miss\":{:.1f},"
 			"\"hash_cache_hit\":{:.1f},\"hash_cache_miss\":{:.1f},"
-			"\"gs_memory\":\"{}\",\"frame_number\":{},"
+			"\"gs_memory\":\"{}\",\"frame_number\":{},\"gs_front_parser\":{},"
 			"\"renderer\":\"{}\",\"device_name\":\"{}\",\"driver_info\":\"{}\""
 			"}}",
 			PerformanceMetrics::GetFPS(), PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetSpeed(),
@@ -375,6 +381,9 @@ namespace PINEServer
 			PerformanceMetrics::GetMaximumFrameTime(),
 			PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetCPUThreadAverageTime(),
 			PerformanceMetrics::GetGSThreadUsage(), PerformanceMetrics::GetGSThreadAverageTime(),
+			// Zero unless GSBackThreadMode >= Lockstep. gs_thread_* is the MTGS thread only,
+			// so under the split the two have to be read together to see the GS cost.
+			PerformanceMetrics::GetGSBackThreadUsage(), PerformanceMetrics::GetGSBackThreadAverageTime(),
 			PerformanceMetrics::GetVUThreadUsage(), PerformanceMetrics::GetVUThreadAverageTime(),
 			PerformanceMetrics::GetGPUUsage(), PerformanceMetrics::GetGPUAverageTime(),
 			PerformanceMetrics::GetLastGPUTime(),
@@ -386,8 +395,196 @@ namespace PINEServer
 			counter(GSPerfMon::TCSourceHit), counter(GSPerfMon::TCSourceMiss),
 			counter(GSPerfMon::TCTargetHit), counter(GSPerfMon::TCTargetMiss),
 			counter(GSPerfMon::HashCacheHit), counter(GSPerfMon::HashCacheMiss),
-			gs_memory.view(), PerformanceMetrics::GetFrameNumber(),
+			// Whether the two-object split actually engaged, which the BackThreadMode setting
+			// alone does not tell you -- it downgrades to lockstep on an unsupported config.
+			// True is also what makes gs_back_thread_* worth reading next to gs_thread_*.
+			gs_memory.view(), PerformanceMetrics::GetFrameNumber(), GSHasFrontParser() ? "true" : "false",
 			Pcsx2Config::GSOptions::GetRendererName(EmuConfig.GS.Renderer), device_name, driver_info);
+	}
+
+	/**
+	 * Escapes a string for embedding in a JSON string literal. Only paths go through this
+	 * -- a Windows path is full of backslashes, which would otherwise leave the reply
+	 * unparseable. BuildStatsJson's sanitizer is a different job: it flattens driver blurb
+	 * that is allowed to lose fidelity, whereas a path the client is about to open is not.
+	 */
+	static std::string JsonEscape(const std::string_view str)
+	{
+		std::string out;
+		out.reserve(str.size());
+		for (const char c : str)
+		{
+			if (c == '"' || c == '\\')
+				out.push_back('\\');
+			out.push_back(c);
+		}
+		return out;
+	}
+
+	/**
+	 * Reports what a setting is actually running as, which on any game carrying GameDB fixes is
+	 * NOT what the INI says: applyGSHardwareFixes runs after the settings load and rewrites
+	 * EmuConfig in memory without ever touching the file. Reading the persisted value alone gets
+	 * you told that autoflush is off while the renderer is running it at 2.
+	 *
+	 * The measurement hazard is worse than the confusion. A settings A/B that writes a key to
+	 * "off" measures the GameDB value in BOTH arms -- because GameDB re-applies it after every
+	 * settings load -- while the two arms report different settings. That is a wrong answer with
+	 * no symptom, on exactly the titles worth investigating.
+	 *
+	 * Effective values come from serialising the live EmuConfig back out through the same wrapper
+	 * that writes the INI, so they land under the identical section/key names the caller already
+	 * uses, and every setting is covered for free. A hand-written key map would need extending by
+	 * every future setting, and the one that got missed would be the one somebody trusted.
+	 *
+	 * `known` false means the key is not part of Pcsx2Config at all -- EnableFastBoot, the UI
+	 * section, anything host-side. That is not an error: it says the persisted value is the whole
+	 * truth for that key, which is worth telling apart from "both agree".
+	 *
+	 * `differs` is deliberately a claim about the two STRINGS and not about the cause. Something
+	 * mutated the config after it was loaded -- a GameDB fix, safe-mode masking, or a settings
+	 * layer this query does not read -- and which one it was is not knowable from here. Naming it
+	 * "overridden" would be inventing the reason.
+	 */
+	static std::string BuildEffectiveSettingJson(const std::string& section, const std::string& key)
+	{
+		MemorySettingsInterface effective_si;
+		{
+			// Serialise a copy, so nothing the wrapper does can reach the live config. The FPCR
+			// backup matches every other Pcsx2Config round-trip in the tree: the struct carries FP
+			// control state, and this runs on the PINE thread, whose FPCR is its own to restore.
+			FPControlRegisterBackup fpcr_backup(FPControlRegister::GetDefault());
+			Pcsx2Config snapshot = EmuConfig;
+			SettingsSaveWrapper wrapper(effective_si);
+			snapshot.LoadSave(wrapper);
+		}
+
+		std::string effective;
+		const bool known = effective_si.GetStringValue(section.c_str(), key.c_str(), &effective);
+
+		std::string persisted;
+		{
+			auto lock = Host::GetSettingsLock();
+			persisted = Host::GetSettingsInterface()->GetStringValue(section.c_str(), key.c_str(), "");
+		}
+
+		// An unpersisted key reads back empty, which means "never written", not "set to empty".
+		// Counting that as a difference would flag most of the config the moment anyone asked,
+		// since the INI only stores what has been changed away from its default.
+		const bool differs = known && !persisted.empty() && persisted != effective;
+
+		return fmt::format(
+			"{{\"section\":\"{}\",\"key\":\"{}\",\"effective\":\"{}\",\"persisted\":\"{}\","
+			"\"known\":{},\"differs\":{}}}",
+			JsonEscape(section), JsonEscape(key), JsonEscape(effective), JsonEscape(persisted),
+			known ? "true" : "false", differs ? "true" : "false");
+	}
+
+	/**
+	 * Queues a GS dump of the next `frames` frames, or stops a dump already recording when
+	 * `frames` is zero -- the same pair of actions the GSDumpMultiFrame hotkey binds to press
+	 * and release. `path` may be empty for the usual auto-named file under the snapshots
+	 * folder. Returns false only if there is no GS to dump, which fails the command.
+	 *
+	 * Marshalled the same way as BuildStatsJson and for the same reason: the MTGS ring is
+	 * single-producer and the PINE thread is not that producer, so pushing a packet from
+	 * here races the EE thread's own writes and can deadlock the two of them. Hop to the CPU
+	 * thread, push from there, and block until the GS thread has taken the request.
+	 *
+	 * The reply describes the request, not a finished file. The dump is opened on the next
+	 * VSync and a multi-frame dump is closed some frames after that, so a client that waits
+	 * for the file has to keep the VM running or step it with MsgFrameAdvance -- a paused VM
+	 * never reaches the VSync that writes anything. A screenshot lands next to the dump too;
+	 * that is inherent to the snapshot path, not something this command adds.
+	 *
+	 * `queued` false carries a `reason`, because both ways a request can be turned away are
+	 * served commands that quietly did nothing rather than socket-level failures. The reasons
+	 * are not symmetric: "snapshot pending" is a request that arrived between another one and
+	 * the VSync servicing it, and retrying a frame later works. "already recording" is a
+	 * refusal -- the snapshot path creates a dump only when none exists, so a second request
+	 * would take a screenshot, write no dump, and overwrite the frame counter of the dump
+	 * already running, cutting it short. Handing back a path for a file that will never appear
+	 * is the worst of the available answers, so stop the running dump first if you mean to.
+	 */
+	static bool QueueGSDump(u32 frames, std::string path, std::string* reply)
+	{
+		if (!MTGS::IsOpen())
+			return false;
+
+		// QueueSnapshot honours a caller-supplied path only when it ends in .png, which it
+		// strips to get the base name shared by the screenshot and the dump; anything else is
+		// silently discarded in favour of an auto-named file in the snapshots folder. Silence
+		// is the wrong failure for a scripted client -- it writes somewhere the script never
+		// looks -- so meet that contract here instead. Drop a dump or image suffix if the
+		// caller spelled one out, so naming the file you want does not earn you a doubled
+		// extension, and let what is left be the base name.
+		if (!path.empty())
+		{
+			for (const std::string_view suffix : {".gs.zst", ".gs.xz", ".gs", ".png"})
+			{
+				if (StringUtil::EndsWithNoCase(path, suffix))
+				{
+					path.erase(path.size() - suffix.size());
+					break;
+				}
+			}
+		}
+
+		bool queued = false, stopped = false;
+		std::string base;
+		const char* dump_ext = "";
+		const char* reason = "";
+
+		Host::RunOnCPUThread(
+			[&]() {
+				MTGS::RunOnGSThread([&]() {
+					if (frames == 0)
+					{
+						GSStopGSDump();
+						stopped = true;
+						return;
+					}
+
+					if (GSIsDumpRecording())
+					{
+						reason = "already recording";
+						return;
+					}
+
+					// Resolve the auto-name here rather than leaving it to QueueSnapshot, so the
+					// reply can name the exact file the client is about to wait for.
+					base = path.empty() ? GSGetBaseSnapshotFilename() : path;
+					queued = GSQueueSnapshot(base + ".png", frames);
+					if (!queued)
+					{
+						reason = "snapshot pending";
+						return;
+					}
+
+					// GSConfig is the GS thread's copy of the config, so read the compression
+					// method here -- it decides the extension the dump writer will append.
+					switch (GSConfig.GSDumpCompression)
+					{
+						case GSDumpCompressionMethod::Uncompressed:
+							dump_ext = ".gs";
+							break;
+						case GSDumpCompressionMethod::LZMA:
+							dump_ext = ".gs.xz";
+							break;
+						default:
+							dump_ext = ".gs.zst";
+							break;
+					}
+				});
+				MTGS::WaitGS(false);
+			},
+			true);
+
+		*reply = fmt::format(
+			"{{\"queued\":{},\"stopped\":{},\"frames\":{},\"path\":\"{}\",\"reason\":\"{}\"}}",
+			queued ? "true" : "false", stopped ? "true" : "false", frames,
+			queued ? JsonEscape(base + dump_ext) : std::string(), reason);
+		return true;
 	}
 } // namespace PINEServer
 
@@ -911,6 +1108,23 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 				ret_cnt += size;
 				break;
 			}
+			case MsgGetEffectiveSetting:
+			{
+				std::string section, key;
+				if (!ReadLengthPrefixedString(buf, buf_cnt, buf_size, &section) ||
+					!ReadLengthPrefixedString(buf, buf_cnt, buf_size, &key)) [[unlikely]]
+					goto error;
+
+				const std::string reply = BuildEffectiveSettingJson(section, key);
+				const u32 size = reply.size() + 1;
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, size + 4, buf_size)) [[unlikely]]
+					goto error;
+				ToResultVector(ret_buffer, size, ret_cnt);
+				ret_cnt += 4;
+				memcpy(&ret_buffer[ret_cnt], reply.c_str(), size);
+				ret_cnt += size;
+				break;
+			}
 			case MsgSetSetting:
 			{
 				std::string section, key, value;
@@ -948,6 +1162,35 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]
 					goto error;
 				Host::RunOnCPUThread([]() { VMManager::FrameAdvance(1); });
+				break;
+			}
+			case MsgGSDump:
+			{
+				// [u32 frames][u32 path_len][path_len bytes]. frames == 0 stops a dump that is
+				// already recording; UINT32_MAX records until something stops it.
+				if (!VMManager::HasValidVM())
+					goto error;
+				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
+					goto error;
+
+				const u32 frames = FromSpan<u32>(buf, buf_cnt);
+				buf_cnt += 4;
+
+				std::string path;
+				if (!ReadLengthPrefixedString(buf, buf_cnt, buf_size, &path)) [[unlikely]]
+					goto error;
+
+				std::string reply;
+				if (!QueueGSDump(frames, std::move(path), &reply)) [[unlikely]]
+					goto error;
+
+				const u32 size = reply.size() + 1;
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, size + 4, buf_size)) [[unlikely]]
+					goto error;
+				ToResultVector(ret_buffer, size, ret_cnt);
+				ret_cnt += 4;
+				memcpy(&ret_buffer[ret_cnt], reply.c_str(), size);
+				ret_cnt += size;
 				break;
 			}
 			default:

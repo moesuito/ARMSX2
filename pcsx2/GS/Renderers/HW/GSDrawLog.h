@@ -71,11 +71,30 @@ namespace GSDrawLog
 		u8 destination_alpha;
 		u8 colormask;
 		u8 barrier; // 0 none, 1 one-barrier, 2 full-barrier
+		u8 self_read; // SelfRead enum, filled during hazard handling
+		u8 prim_overlap; // GSState::PRIM_OVERLAP -- whether the draw's own primitives overlap
 
 		s16 area_x;
 		s16 area_y;
 		s16 area_z;
 		s16 area_w;
+	};
+
+	/// How a draw whose texture aliased the render target or depth buffer was resolved.
+	///
+	/// The tex_hazard and barrier columns are the draw config AFTER
+	/// GSRendererHW::HandleTextureHazards rewrote it, so a draw that arrived aliasing the
+	/// target and was resolved by copying is indistinguishable in them from an ordinary
+	/// textured draw -- it reads as tex_hazard NONE, barrier 0, no copy anywhere in sight.
+	/// Reading that resolved state as the original state produced a confidently wrong
+	/// diagnosis once. This column records which road the draw actually took.
+	enum SelfRead : u8
+	{
+		SelfReadNone = 0, ///< the source did not alias the render target or depth buffer
+		SelfReadTexIsFb, ///< read its own fragment's framebuffer value in the shader
+		SelfReadBarrier, ///< sampled the live attachment under a barrier
+		SelfReadDepthDirect, ///< sampled the depth buffer directly, no barrier needed
+		SelfReadCopy, ///< copied the target and sampled the copy
 	};
 
 	enum Flags : u8
@@ -87,6 +106,7 @@ namespace GSDrawLog
 		FlagZTest = 1 << 4,
 		FlagZMask = 1 << 5,
 		FlagSubmitted = 1 << 6, ///< reached the backend; absent means the draw was skipped
+		FlagFeedbackLoopRT = 1 << 7, ///< the pixel shader reads the render target (any reason)
 	};
 
 	/// Whether recording is currently active. Cheap enough to test per draw.
@@ -102,9 +122,15 @@ namespace GSDrawLog
 	/// the arena is full.
 	void BeginDraw(const Record& ps2_state);
 
+	/// Records how a target-aliasing source was resolved, on the open row. Called from
+	/// hazard handling rather than at submit because the resolution is not recoverable
+	/// from the finished draw config -- see SelfRead.
+	void NoteSelfRead(SelfRead resolution);
+
 	/// Completes the row opened by BeginDraw with the backend view. No-op if BeginDraw
-	/// did not record one (inactive, or arena full).
-	void EndDraw(const GSHWDrawConfig& config);
+	/// did not record one (inactive, or arena full). prim_overlap is GSState::PRIM_OVERLAP,
+	/// passed in because it lives on the renderer rather than the draw config.
+	void EndDraw(const GSHWDrawConfig& config, u8 prim_overlap);
 
 	/// Closes any row left open by a draw that returned before submit, so skipped draws
 	/// still appear. Called on every exit from GSRendererHW::Draw.

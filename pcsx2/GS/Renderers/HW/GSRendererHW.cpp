@@ -6231,6 +6231,26 @@ void GSRendererHW::EmulateDATEGetConfig(DATEOptions& date_options, bool scale_rt
 		m_conf.destination_alpha = GSHWDrawConfig::DestinationAlphaMode::Full;
 	else if (features.stencil_buffer)
 		m_conf.destination_alpha = GSHWDrawConfig::DestinationAlphaMode::Stencil;
+	else
+	{
+		// Read-only stencil is the fallback every branch above leans on, and it needs a stencil
+		// attachment. Adreno has none: depth is created as plain D32F because any stencil-bearing
+		// depth buffer trips the A6xx hangcheck. Upstream never reaches here — it only clears
+		// stencil_buffer alongside framebuffer fetch, which is selected much earlier — so without
+		// this branch the draw left this function with destination_alpha never assigned, i.e. still
+		// holding whatever the PREVIOUS draw picked. m_conf is a member and is not cleared per draw.
+		//
+		// Sampling destination alpha in the shader answers the same question a read-only stencil
+		// pre-pass does: both test the target as it stood before the draw, so this is a like-for-like
+		// substitution, not a downgrade. One barrier is what makes that snapshot available — with
+		// texture barriers the backend inserts a real barrier, without them it copies the target and
+		// binds the copy. DATE >= 5 is already part of PSSelector::IsFeedbackLoopRT, so the copy
+		// happens with no backend change.
+		GL_PERF("DATE: Accurate with one barrier (no stencil buffer)");
+		date_options.barrier = true;
+		m_conf.require_one_barrier = true;
+		m_conf.destination_alpha = GSHWDrawConfig::DestinationAlphaMode::Full;
+	}
 
 	if (scale_rt_alpha)
 		m_conf.datm = static_cast<SetDATM>(m_cached_ctx.TEST.DATM + 2);
@@ -8512,6 +8532,18 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 	const int tex_diff = tex->m_from_target ? static_cast<int>(m_cached_ctx.TEX0.TBP0 - tex->m_from_target->m_TEX0.TBP0) : static_cast<int>(m_cached_ctx.TEX0.TBP0 - tex->m_TEX0.TBP0);
 	const int frame_diff = rt ? static_cast<int>(m_cached_ctx.FRAME.Block() - rt->m_TEX0.TBP0) : 0;
 
+	// Whether the source aliases this draw's own render target or depth buffer. Everything
+	// below rewrites m_conf to resolve that, so it is not recoverable afterwards -- hence
+	// the ledger is told here, pessimistically, and each road that avoids the copy corrects
+	// it on the way out.
+	const bool log_self_read =
+		GSDrawLog::IsActive() && ((rt && m_conf.tex == m_conf.rt) || (ds && m_conf.tex == m_conf.ds));
+	auto NoteResolution = [&](GSDrawLog::SelfRead resolution) {
+		if (log_self_read) [[unlikely]]
+			GSDrawLog::NoteSelfRead(resolution);
+	};
+	NoteResolution(GSDrawLog::SelfReadCopy);
+
 	// Needs to be called everywhere we return early except tex is fb, or read only depth.
 	auto HandleBarrierHazard = [&](bool src_empty) -> bool {
 		// Feedback loops conditions explained:
@@ -8575,6 +8607,7 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 				else
 					m_conf.require_full_barrier = true;
 
+				NoteResolution(GSDrawLog::SelfReadTexIsFb);
 				unscaled_size = rt->GetUnscaledSize();
 				scale = rt->GetScale();
 				return;
@@ -8590,6 +8623,7 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 				{
 					if (HandleBarrierHazard(true))
 					{
+						NoteResolution(GSDrawLog::SelfReadBarrier);
 						unscaled_size = rt->GetUnscaledSize();
 						scale = rt->GetScale();
 						return;
@@ -8610,6 +8644,9 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 				{
 					// Safe to read!
 					GL_CACHE("HW: Source is depth buffer, not writing, safe to read.");
+					NoteResolution(m_conf.tex_hazard == GSHWDrawConfig::TEX_HAZARD_DEPTH ?
+									   GSDrawLog::SelfReadBarrier :
+									   GSDrawLog::SelfReadDepthDirect);
 					unscaled_size = ds->GetUnscaledSize();
 					scale = ds->GetScale();
 					return;
@@ -8626,6 +8663,9 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 				{
 					if (HandleBarrierHazard(true))
 					{
+						NoteResolution(m_conf.tex_hazard == GSHWDrawConfig::TEX_HAZARD_DEPTH ?
+										   GSDrawLog::SelfReadBarrier :
+										   GSDrawLog::SelfReadDepthDirect);
 						unscaled_size = ds->GetUnscaledSize();
 						scale = ds->GetScale();
 						return;
@@ -8700,6 +8740,7 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 
 			if (HandleBarrierHazard(false) || (rt != tex->m_from_target && ds != tex->m_from_target))
 			{
+				NoteResolution(GSDrawLog::SelfReadBarrier);
 				m_conf.cb_ps.ChannelShuffleOffset = GSVector2((horizontal_offset - m_r.x) * tex->GetScale(), (vertical_offset - m_r.y) * tex->GetScale());
 				target_region = false;
 				source_region.bits = 0;
@@ -9717,7 +9758,7 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 
 	// Completes the row opened at the top of Draw() with the backend view, which only
 	// exists here.
-	GSDrawLog::EndDraw(m_conf);
+	GSDrawLog::EndDraw(m_conf, static_cast<u8>(m_prim_overlap));
 
 	if (!m_channel_shuffle_width)
 		g_gs_device->RenderHW(m_conf);

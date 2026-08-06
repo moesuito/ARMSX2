@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -70,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import com.armsx2.R
 import com.armsx2.ui.theme.ArmsBlue
 import com.armsx2.ui.theme.ArmsCyan
+import com.armsx2.ui.settings.controllerFocusable
 
 @Composable
 fun ArmsBackdrop(
@@ -148,17 +150,34 @@ fun ArmsTopBar(
 ) {
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val navBarPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    // Also clear a top/centre display cutout (punch-hole camera). In portrait on a tall panel the
+    // status bar can be hidden or shorter than the camera, so statusBars alone leaves the pill riding
+    // up under the lens; take the larger of the two so the top bar always sits clear of it.
+    // (#Isshin — S24 Ultra portrait.) Landscape/no-cutout devices see no change (cutout top is 0).
+    val cutoutTop = WindowInsets.displayCutout.asPaddingValues().calculateTopPadding()
+    val topInset = maxOf(statusBarPadding, cutoutTop)
+    // On a custom bar colour the theme's onSurface can be unreadable (white text on yellow), so
+    // pick black or white by the colour's own luminance. Null = no custom colour, theme unchanged.
+    val customBar = com.armsx2.ui.theme.LibraryChromePreferences.barColor.value.takeIf { it != 0 }
+    val barContentColor = customBar?.let {
+        val lum = (0.299 * android.graphics.Color.red(it) +
+            0.587 * android.graphics.Color.green(it) +
+            0.114 * android.graphics.Color.blue(it)) / 255.0
+        if (lum > 0.6) Color(0xFF101317) else Color.White
+    }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .padding(
                 start = horizontalPadding,
                 end = horizontalPadding,
-                top = if (bottomEdge) 4.dp else statusBarPadding + 8.dp,
+                top = if (bottomEdge) 4.dp else topInset + 8.dp,
                 bottom = if (bottomEdge) navBarPadding + 8.dp else 4.dp,
             ),
         shape = RoundedCornerShape(26.dp),
-        color = MaterialTheme.colorScheme.surface,
+        // Custom bar colour when set, otherwise the theme surface (unchanged default).
+        color = com.armsx2.ui.theme.LibraryChromePreferences.barColor.value
+            .takeIf { it != 0 }?.let { Color(it) } ?: MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.38f)),
         tonalElevation = 0.dp,
         shadowElevation = 5.dp,
@@ -172,7 +191,7 @@ fun ArmsTopBar(
             Column(Modifier.weight(1f)) {
                 Text(
                     title,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = barContentColor ?: MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
@@ -181,7 +200,8 @@ fun ArmsTopBar(
                 if (!subtitle.isNullOrBlank()) {
                     Text(
                         text = subtitle,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = barContentColor?.copy(alpha = 0.78f)
+                            ?: MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -229,6 +249,10 @@ fun RoundAction(
     buttonShape: Shape = CircleShape,
     subtleFrame: Boolean = false,
     glyphColor: Color? = null,
+    /** Register this action with the controller-nav registry under this id so a pad can reach it.
+     *  Opt-in (null = today's touch-only behaviour): these live in top bars, and registering every
+     *  one of them app-wide would reshuffle the nav order of screens that are already tuned. */
+    controllerId: String? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -255,6 +279,12 @@ fun RoundAction(
         modifier = Modifier
             .size(buttonSize)
             .semantics { contentDescription = description }
+            .then(
+                if (controllerId != null)
+                    Modifier.controllerFocusable(controllerId, buttonShape as? RoundedCornerShape
+                        ?: RoundedCornerShape(50), onConfirm = onClick)
+                else Modifier,
+            )
             .focusable(interactionSource = interaction),
         shape = buttonShape,
         color = actionColor,

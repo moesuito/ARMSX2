@@ -7,6 +7,7 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GS/GSVertexKick.h"
+#include "PerformanceMetrics.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -93,7 +94,7 @@ constexpr int GSState::GetSaveStateSize(int version)
 	return size;
 }
 
-GSState::GSState(GSBackQueue::Channel* shared_chan)
+GSState::GSState(GSBackQueue::Channel* shared_chan, bool is_front_parser)
 	: m_vt(this)
 {
 	// m_nativeres seems to be a hack. Unfortunately it impacts draw call number which make debug painful in the replayer.
@@ -150,8 +151,13 @@ GSState::GSState(GSBackQueue::Channel* shared_chan)
 
 	// Hardware renderers only: the SW renderer never issues GPU downloads, so there is
 	// nothing to shadow and MTGS::InitAndReadFIFO keeps taking the synchronizing path.
-	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+	// The front parser object is skipped as well — it borrows the back's shadow through
+	// m_mem_target, so allocating one here would cost a GS-memory-sized copy nobody reads.
+	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer() &&
+		!is_front_parser)
+	{
 		EnsureAsyncReadbackMemory();
+	}
 
 	m_v.RGBAQ.Q = 1.0f;
 
@@ -211,11 +217,12 @@ GSState::~GSState()
 }
 
 GSFrontState::GSFrontState(GSState* back)
-	: GSState(back->GetBackChannel())
+	: GSState(back->GetBackChannel(), true)
 	, m_back(back)
 {
 	m_mem_target = back;
 	back->m_split_back = true;
+	back->m_parse_target = this;
 }
 
 GSFrontState::~GSFrontState()
@@ -223,6 +230,7 @@ GSFrontState::~GSFrontState()
 	// Pool nodes referenced by in-flight records belong to the back's channel
 	// and outlive us, but drain anyway so teardown never depends on ordering.
 	DrainBackQueue();
+	m_back->m_parse_target = m_back;
 }
 
 void GSFrontState::Draw()
@@ -349,9 +357,27 @@ void GSState::Reset(bool hardware_reset)
 	m_perfmon_frame.Reset();
 }
 
-template<bool auto_flush>
+template<bool auto_flush, bool sprites_only>
 void GSState::SetPrimHandlers()
 {
+	// The auto_flush instantiations exist to feed HandleAutoFlush, which reads the
+	// incoming vertex out of m_v -- so they stage every vertex through m_v instead of
+	// keeping it in registers. At SpritesOnly that is wasted on everything that is not
+	// a sprite: IsAutoFlushDraw early-outs on the prim before it looks at anything, so
+	// the staged vertex is written, read once, and discarded. Give those prims the
+	// fused direct kick.
+	//
+	// Measured on Dragon Quest VIII (SLUS-21207, 240 frames). It renders identically at
+	// levels 1 and 2 -- same draws, passes and copies -- so level 2 is an exact staged
+	// control for level 1's direct path, with no rendering difference to confound it:
+	// GS-thread cycles 2043.2M staged against 1947.4M direct over 3 runs each, ranges
+	// disjoint. That is -4.7% of GS-thread time in a title spending 8% of it in this one
+	// handler, and 581 GameDB entries ship autoFlush: 1.
+	//
+	// Mirrors IsAutoFlushDraw's early-out exactly, which keys on the level alone and
+	// not on the renderer, so the software path narrows in step with it.
+	constexpr bool non_sprite_af = auto_flush && !sprites_only;
+
 #define SetHandlerXYZ(P, auto_flush) \
 	m_fpGIFPackedRegHandlerXYZ[P][0] = &GSState::GIFPackedRegHandlerXYZF2<P, 0, auto_flush>; \
 	m_fpGIFPackedRegHandlerXYZ[P][1] = &GSState::GIFPackedRegHandlerXYZF2<P, 1, auto_flush>; \
@@ -365,13 +391,13 @@ void GSState::SetPrimHandlers()
 	m_fpGIFPackedRegHandlerSTQRGBAXYZ2[P] = &GSState::GIFPackedRegHandlerSTQRGBAXYZ2<P, auto_flush>;
 
 	SetHandlerXYZ(GS_POINTLIST, true);
-	SetHandlerXYZ(GS_LINELIST, auto_flush);
-	SetHandlerXYZ(GS_LINESTRIP, auto_flush);
-	SetHandlerXYZ(GS_TRIANGLELIST, auto_flush);
-	SetHandlerXYZ(GS_TRIANGLESTRIP, auto_flush);
-	SetHandlerXYZ(GS_TRIANGLEFAN, auto_flush);
+	SetHandlerXYZ(GS_LINELIST, non_sprite_af);
+	SetHandlerXYZ(GS_LINESTRIP, non_sprite_af);
+	SetHandlerXYZ(GS_TRIANGLELIST, non_sprite_af);
+	SetHandlerXYZ(GS_TRIANGLESTRIP, non_sprite_af);
+	SetHandlerXYZ(GS_TRIANGLEFAN, non_sprite_af);
 	SetHandlerXYZ(GS_SPRITE, auto_flush);
-	SetHandlerXYZ(GS_INVALID, auto_flush);
+	SetHandlerXYZ(GS_INVALID, non_sprite_af);
 
 #undef SetHandlerXYZ
 }
@@ -643,6 +669,9 @@ void GSState::StartBackThread()
 {
 	m_back_thread_exit.store(false, std::memory_order_release);
 	m_chan->consumer_running = true;
+	// Claim the empty-wait for this thread (the MTGS thread — every drain site,
+	// and the lockstep tail of PushRecord, run on it). See Channel::drain_thread.
+	m_chan->drain_thread = std::this_thread::get_id();
 	m_back_thread = std::thread(&GSState::BackThreadLoop, this);
 	// The drain policy is the PRODUCER's (the front object under the split
 	// runs pipelined while this back object's own flag stays lockstep), so
@@ -660,6 +689,7 @@ void GSState::StopBackThread()
 	m_back_thread_exit.store(true, std::memory_order_release);
 	m_chan->sema.NotifyOfWork();
 	m_back_thread.join();
+	PerformanceMetrics::SetGSBackThread({});
 	m_chan->consumer_running = false;
 	m_back_queued = false;
 }
@@ -668,13 +698,24 @@ void GSState::DrainBackQueue()
 {
 	// Keyed on the channel, not this object's producer flag, so drains work
 	// from either side of the two-object split.
-	if (m_chan->consumer_running)
-		m_chan->sema.WaitForEmpty();
+	if (!m_chan->consumer_running)
+		return;
+
+	// Only the thread that started the consumer may wait for empty; a second
+	// waiter hangs for good. Checked here rather than relying on WaitForEmpty's
+	// own assert, which only trips when the two waits happen to overlap — this
+	// one trips on the first off-thread drain, whatever the timing.
+	pxAssertMsg(std::this_thread::get_id() == m_chan->drain_thread,
+		"GS back queue drained off the MTGS thread (single empty-waiter channel)");
+
+	m_chan->sema.WaitForEmpty();
 }
 
 void GSState::BackThreadLoop()
 {
 	Threading::SetNameOfCurrentThread("GS Back");
+
+	Threading::ThreadHandle handle(Threading::ThreadHandle::GetForCallingThread());
 
 	// A new thread inherits the spawner's affinity mask, and the spawner here is
 	// the MTGS thread — which EnableThreadPinning may have pinned to a single
@@ -682,7 +723,12 @@ void GSState::BackThreadLoop()
 	// Sharing that one core would time-slice front and back and silently
 	// re-serialize the split, so clear to all cores. VMManager owns any future
 	// explicit pinning policy for this thread.
-	Threading::ThreadHandle::GetForCallingThread().SetAffinity(0);
+	handle.SetAffinity(0);
+
+	// Half the GS work runs here under the split, and the OSD's "GS" figure is the MTGS
+	// thread alone — so without this the mode reads as a large GS saving that is really
+	// just work moved off the measured thread.
+	PerformanceMetrics::SetGSBackThread(std::move(handle));
 
 	for (;;)
 	{
@@ -1088,9 +1134,16 @@ void GSState::ResetHandlers()
 	m_fpGIFPackedRegHandlers[GIF_REG_NOP] = &GSState::GIFPackedRegHandlerNOP;
 
 	if (IsAutoFlushEnabled())
-		SetPrimHandlers<true>();
+	{
+		if (GSConfig.UserHacks_AutoFlush == GSHWAutoFlushLevel::SpritesOnly)
+			SetPrimHandlers<true, true>();
+		else
+			SetPrimHandlers<true, false>();
+	}
 	else
-		SetPrimHandlers<false>();
+	{
+		SetPrimHandlers<false, false>();
+	}
 
 	std::fill(std::begin(m_fpGIFRegHandlers), std::end(m_fpGIFRegHandlers), &GSState::GIFRegHandlerNull);
 
@@ -1161,16 +1214,22 @@ void GSState::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 {
 	m_mipmap = GSConfig.Mipmap;
 
-	if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+	// Only the object owning local memory owns the shadow. UpdateSettings runs on both halves
+	// of the pipelined split (GS.cpp), and the front's accessors all resolve to the back, so
+	// letting it through here would re-seed a copy nobody reads on every settings change.
+	if (m_mem_target == this)
 	{
-		if (old_config.HWDownloadMode != GSHardwareDownloadMode::Asynchronous || !m_async_readback_mem)
-			EnsureAsyncReadbackMemory();
-	}
-	else if (old_config.HWDownloadMode == GSHardwareDownloadMode::Asynchronous)
-	{
-		// The allocation is deliberately kept (the EE thread may be mid-read), but stop
-		// publishing into it so a later re-enable always re-seeds from live memory.
-		m_async_readback_ready.store(false, std::memory_order_release);
+		if (GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSConfig.UseHardwareRenderer())
+		{
+			if (old_config.HWDownloadMode != GSHardwareDownloadMode::Asynchronous || !m_async_readback_mem)
+				EnsureAsyncReadbackMemory();
+		}
+		else if (old_config.HWDownloadMode == GSHardwareDownloadMode::Asynchronous)
+		{
+			// The allocation is deliberately kept (the EE thread may be mid-read), but stop
+			// publishing into it so a later re-enable always re-seeds from live memory.
+			m_async_readback_ready.store(false, std::memory_order_release);
+		}
 	}
 
 	if (
@@ -4056,13 +4115,28 @@ void GSState::ReadFIFO(u8* mem, int size)
 
 	Read(mem, size);
 
-	if (m_dump)
-		m_dump->ReadFIFO(size / 16);
+	if (GSDumpBase* dump = GetDumpSink())
+		dump->ReadFIFO(size / 16);
 }
 
 void GSState::ReadLocalMemoryUnsync(u8* mem, int qwc, GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG)
 {
-	DrainBackQueue();
+	// Deliberately does NOT drain the back queue. This runs on the EE thread, and
+	// the queue's empty-wait admits exactly one waiter — the MTGS thread, which is
+	// already using it (the lockstep tail of PushRecord, and InitReadFIFO servicing
+	// the very AsyncReadFIFO packet this function queues). Two waiters and one of
+	// them never wakes: a hard hang in Release, where the assert inside
+	// WaitForEmpty is compiled out.
+	//
+	// Nothing is lost by leaving it out. The Asynchronous path below reads the
+	// shadow copy under m_async_readback_mutex, which is the real synchronization
+	// point and is published by the GS thread; a drain adds nothing and would stall
+	// the EE thread on the GS thread, which is exactly what the mode exists to
+	// avoid. The Unsynchronized path races the renderer's local-memory writes by
+	// definition — a drain narrows that window without closing it, since MTGS can
+	// queue another record the instant it returns. GS.cpp caps the staleness the
+	// real way, by refusing the pipelined front-object split whenever HW downloads
+	// are read from the EE thread.
 
 	const int w = TRXREG.RRW;
 	const int h = TRXREG.RRH;
@@ -4368,8 +4442,11 @@ void GSState::Transfer(const u8* mem, u32 size)
 		}
 	}
 
-	if (m_dump && mem > start)
-		m_dump->Transfer(index, start, mem - start);
+	if (mem > start)
+	{
+		if (GSDumpBase* dump = GetDumpSink())
+			dump->Transfer(index, start, mem - start);
+	}
 
 	if (index == 0)
 	{

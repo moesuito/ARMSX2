@@ -73,6 +73,7 @@ SmallString s_hardware_info_gpu_line;
 SmallString s_cpu_jit_line;
 SmallString s_cpu_usage_ee_line;
 SmallString s_cpu_usage_gs_line;
+SmallString s_cpu_usage_gs_back_line;
 SmallString s_cpu_usage_vu_line;
 std::vector<SmallString> s_software_thread_lines;
 SmallString s_capture_line;
@@ -82,6 +83,15 @@ SmallString s_gpu_stats_line;
 SmallString s_speed_icon;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 SmallString s_ios_device_stats_line;
+
+// Set by the iOS CMakeLists alongside the bundle version, so the overlay and
+// the About screen cannot disagree. "dev" only shows up in a build that came
+// from somewhere else.
+#if defined(ARMSX2_VERSION_STR)
+#define ARMSX2_IOS_OSD_VERSION ARMSX2_VERSION_STR
+#else
+#define ARMSX2_IOS_OSD_VERSION "dev"
+#endif
 #endif
 
 // Shrink-to-fit for the performance overlay. Only ever comes down, and only far enough for the widest
@@ -458,19 +468,6 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 			s_speed_line.clear();
 
 #if defined(__ANDROID__)
-			// Display-rate limiters, FIRST in the line so they read as a qualifier on the FPS that
-			// follows rather than a stray value. Shown only while ACTIVE, so they cost nothing and
-			// need no toggle of their own. Both lower the ON-SCREEN rate while emulation keeps
-			// running full speed, so without a label a capped display is indistinguishable from the
-			// emulator running badly — which is a good part of why these looked broken.
-			if (const u32 fps_cap = GSGetMaxPresentFps(); fps_cap > 0)
-			{
-				s_speed_line.append_format("FPS CAP: {}", fps_cap);
-				// The cap is deliberately bypassed while fast-forwarding so the speed-up stays
-				// visible; say so, or it looks like the cap is simply being ignored.
-				if (GSGetPresentCapSuspended())
-					s_speed_line.append(" (off: FF)");
-			}
 			if (const u32 skip = GSGetManualFrameSkip(); skip > 0)
 				s_speed_line.append_format("{}SKIP: {}", s_speed_line.empty() ? "" : " | ", skip);
 #endif
@@ -491,6 +488,17 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					default:
 						s_speed_line.append("FPS: N/A");
 						break;
+				}
+
+				if (const u32 fps_cap_milli = GSGetMaxPresentMilliFps();
+					fps_cap_milli > 0 && fps_cap_milli != 60000 && !GSGetPresentCapSuspended())
+				{
+					std::string fps_cap = fmt::format("{:.3f}", static_cast<double>(fps_cap_milli) / 1000.0);
+					while (fps_cap.back() == '0')
+						fps_cap.pop_back();
+					if (fps_cap.back() == '.')
+						fps_cap.pop_back();
+					s_speed_line.append_format(" (Cap {} FPS)", fps_cap);
 				}
 			}
 
@@ -521,6 +529,11 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					s_speed_line.append_format("{}ARMSX2-MacOS 2.1 | Core: {}",
 						s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 				}
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+				// Version comes from the one place it is set, so this cannot drift
+				// the way the two branches either side of it have.
+				s_speed_line.append_format("{}ARMSX2 " ARMSX2_IOS_OSD_VERSION " | Core: {}",
+					s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #elif defined(__ANDROID__)
 				s_speed_line.append_format("{}ARMSX2 2.7", s_speed_line.empty() ? "" : " | ");
 #else
@@ -640,6 +653,16 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				FormatProcessorStat(s_cpu_usage_gs_line, PerformanceMetrics::GetGSThreadUsage(), PerformanceMetrics::GetGSThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_line.c_str(), OsdTextColor());
 
+				// Only exists under GSBackThreadMode >= Lockstep. The line above is the MTGS
+				// thread alone, so without this one the split's second half is invisible.
+				if (PerformanceMetrics::HasGSBackThread())
+				{
+					s_cpu_usage_gs_back_line.assign("GSB: ");
+					FormatProcessorStat(s_cpu_usage_gs_back_line, PerformanceMetrics::GetGSBackThreadUsage(),
+						PerformanceMetrics::GetGSBackThreadAverageTime());
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_back_line.c_str(), OsdTextColor());
+				}
+
 				if (THREAD_VU1)
 				{
 					s_cpu_usage_vu_line.assign("VU: ");
@@ -747,6 +770,8 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 #endif
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_ee_line.c_str(), OsdTextColor());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_line.c_str(), OsdTextColor());
+				if (PerformanceMetrics::HasGSBackThread())
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_back_line.c_str(), OsdTextColor());
 				if (THREAD_VU1)
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
 

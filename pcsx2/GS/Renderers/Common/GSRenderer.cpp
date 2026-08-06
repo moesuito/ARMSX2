@@ -4,6 +4,8 @@
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiManager.h"
 #include "GS/Renderers/Common/GSRenderer.h"
+#include "GS/Renderers/Common/GSInterlaceModePolicy.h"
+#include "GS/Renderers/Common/GSPresentationPolicy.h"
 #include "GS/GSCapture.h"
 #include "GS/GSDump.h"
 #include "GS/GS.h"
@@ -67,6 +69,11 @@ static bool s_portrait_render_top = true;
 // Zero everywhere else; only consulted on the top-align path, which by definition has spare room
 // below it (that space is what the touch controls occupy).
 static int s_portrait_render_top_inset = 0;
+// Android landscape: top-align the render instead of vertically centering it. Foldables and
+// clamshell controllers (Backbone and friends) open the screen DOWNWARD, so a centred image sits
+// awkwardly low and the letterbox lands where the hinge/controller is — reported as the one thing
+// keeping those users on another emulator. Default off (centre), so nothing changes unless asked.
+static bool s_landscape_render_top = false;
 
 // Defined further down alongside the present path. Forward-declared because Merge() needs the
 // frame's on-screen rect to size the RetroArch shader chain, and it runs before them.
@@ -100,6 +107,7 @@ void GSRenderer::UpdateRenderFixes()
 {
 }
 
+template <GSRenderer::MergeMode merge_mode>
 bool GSRenderer::Merge(int field)
 {
 	GSVector2i fs(0, 0);
@@ -175,21 +183,34 @@ bool GSRenderer::Merge(int field)
 
 	s_n++;
 
+	// Progressive frames have no temporal deinterlacing state to preserve. Once the active
+	// outputs have been resolved, a frame which will not be presented can therefore omit the
+	// display merge and all following post-processing without affecting emulated GS memory.
+	if constexpr (merge_mode == MergeMode::SkipFinalComposition)
+	{
+		if (m_scanmask_used)
+			m_scanmask_used--;
+		return true;
+	}
+
 	GSVector4 src_gs_read[2];
 	GSVector4 dst[3];
 
 	// Use offset for bob deinterlacing always, extra offset added later for FFMD mode.
 	const bool scanmask_frame = m_scanmask_used && abs(PCRTCDisplays.PCRTCDisplays[0].displayRect.y - PCRTCDisplays.PCRTCDisplays[1].displayRect.y) != 1;
-	int field2 = 0;
-	int mode = 3; // If the game is manually deinterlacing then we need to bob (if we want to get away with no deinterlacing).
-	bool is_bob = GSConfig.InterlaceMode == GSInterlaceMode::BobTFF || GSConfig.InterlaceMode == GSInterlaceMode::BobBFF;
-
 	// FFMD (half frames) requires blend deinterlacing, so automatically use that. Same when SCANMSK is used but not blended in the merge circuit (Alpine Racer 3).
-	if (GSConfig.InterlaceMode != GSInterlaceMode::Automatic || (!game_deinterlacing && !m_regs->SMODE2.FFMD && !scanmask_frame))
-	{
-		field2 = ((static_cast<int>(GSConfig.InterlaceMode) - 2) & 1);
-		mode = ((static_cast<int>(GSConfig.InterlaceMode) - 2) >> 1);
-	}
+	// Centralised in GSInterlaceModePolicy.h so the progressive pass-through case (shader_mode -1)
+	// is pinned by static_assert and unit tests rather than resting on the sign behaviour of a
+	// shift. Ported from sashkinbro/EmuCoreX.
+	const GSInterlaceModeSelection interlace_selection = SelectGSInterlaceMode(
+		static_cast<int>(GSConfig.InterlaceMode),
+		GSConfig.InterlaceMode == GSInterlaceMode::Automatic,
+		game_deinterlacing,
+		m_regs->SMODE2.FFMD,
+		scanmask_frame);
+	const int field2 = interlace_selection.field_offset;
+	int mode = interlace_selection.shader_mode;
+	bool is_bob = GSConfig.InterlaceMode == GSInterlaceMode::BobTFF || GSConfig.InterlaceMode == GSInterlaceMode::BobBFF;
 
 	// FastMAD (mode 3) stores four fields in a two-bank history target. Older Mali-G57 Vulkan drivers
 	// can expose stale/alternating banks during reconstruction; Bob isn't a safe fallback (its
@@ -273,6 +294,15 @@ bool GSRenderer::Merge(int field)
 		const float offset = is_bob ? (tex[1] ? tex_scale[1] : tex_scale[0]) : 0.0f;
 
 		g_gs_device->Interlace(fs, field ^ field2, mode, offset);
+	}
+
+	// Adaptive deinterlacing consumes prior fields. A skipped interlaced frame must update that
+	// history, but it does not need optional visual filters or output-size shader work.
+	if constexpr (merge_mode == MergeMode::InterlaceHistoryOnly)
+	{
+		if (m_scanmask_used)
+			m_scanmask_used--;
+		return true;
 	}
 
 	if (GSConfig.ShadeBoost)
@@ -374,6 +404,13 @@ static float GetCurrentAspectRatioFloat(bool is_progressive)
 			return 10.0f / 7.0f;
 		case AspectRatioType::R21_9:
 			return 21.0f / 9.0f;
+		case AspectRatioType::R20_9:
+			return 20.0f / 9.0f;
+		case AspectRatioType::R19_5_9:
+			return 19.5f / 9.0f;
+		case AspectRatioType::Custom:
+			// Clamped, not trusted: a 0 or negative would divide by zero downstream.
+			return std::clamp(GSConfig.CustomAspectRatio, 0.5f, 5.0f);
 	}
 }
 
@@ -436,6 +473,18 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 	else if (aspect == AspectRatioType::R21_9)
 	{
 		targetAr = 21.0f / 9.0f;
+	}
+	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R20_9)
+	{
+		targetAr = 20.0f / 9.0f;
+	}
+	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::R19_5_9)
+	{
+		targetAr = 19.5f / 9.0f;
+	}
+	else if (EmuConfig.CurrentAspectRatio == AspectRatioType::Custom)
+	{
+		targetAr = std::clamp(GSConfig.CustomAspectRatio, 0.5f, 5.0f);
 	}
 
 	const float crop_adjust = (static_cast<float>(src_rect.width()) / static_cast<float>(src_size.x)) /
@@ -501,16 +550,28 @@ static GSVector4 CalculateDrawDstRect(s32 window_width, s32 window_height, const
 				break;
 		}
 	}
+	const bool is_portrait_window_outer = window_height > window_width;
 	if (target_height >= f_height)
 	{
-		target_y = -((target_height - f_height) * 0.5f);
+		// The render is TALLER than the window, so the overflow is normally split evenly and the
+		// image is cropped at both edges. Top-align instead when asked: anchor the top edge and let
+		// the crop fall entirely at the bottom.
+		//
+		// ★ This branch is the one landscape actually takes. A 4:3 game on a wide phone fills the
+		// height and pillarboxes the sides, so there is no vertical slack and the `else` below never
+		// runs — which is exactly why the landscape setting appeared to do nothing at first.
+		target_y = (!dedicated_external && s_landscape_render_top && !is_portrait_window_outer)
+			? 0.0f
+			: -((target_height - f_height) * 0.5f);
 	}
 	else
 	{
 		// Android #375: top-align the render in a PORTRAIT window (bottom stays free for
 		// touch controls). Vertical only — horizontal alignment (target_x) is unchanged.
+		const bool is_portrait_window = is_portrait_window_outer;
 		GSDisplayAlignment v_align = alignment;
-		if (!dedicated_external && s_portrait_render_top && window_height > window_width)
+		if (!dedicated_external && ((s_portrait_render_top && is_portrait_window) ||
+			(s_landscape_render_top && !is_portrait_window)))
 			v_align = GSDisplayAlignment::LeftOrTop;
 		switch (v_align)
 		{
@@ -762,11 +823,12 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	// FPS cap silently did nothing. The GS.cpp comments named this exact function as the reader, so
 	// the consumer was lost rather than never written. Restored here.
 	//
-	// Both skip only the PRESENT: Merge() and the rest of the frame still run below, so emulation
-	// and GS state are untouched and only display rate changes.
+	// Manual skipping omits presentation only. Platform-opted FPS caps may additionally omit final
+	// composition after Merge() has verified the current outputs; emulation and GS writes still run.
 	// Set when the user ASKED for a dropped present, so the stale-frame diagnostic below doesn't
 	// report their own frame-skip/FPS-cap settings as a fault.
 	bool deliberate_present_skip = false;
+	bool fps_cap_present_skip = false;
 	{
 		const u32 manual_skip = GSGetManualFrameSkip();
 		if (manual_skip > 0)
@@ -784,35 +846,78 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			m_manual_frameskip_phase = 0;
 		}
 	}
-	if (!skip_frame && !GSGetPresentCapSuspended())
+	if (!skip_frame)
 	{
-		// Accumulator pacer, not a simple "too soon?" test: advancing the deadline by exactly one
-		// interval holds the requested AVERAGE rate even when it isn't a whole division of the
-		// source (47 or 55 fps work, not just 30/20/15). Resynchronise when we fall more than one
-		// interval behind, so a hitch can't bank credit and then burst.
-		const u64 interval = GSGetMaxPresentInterval();
-		if (interval > 0)
+		if (!GSGetPresentCapSuspended())
 		{
-			const u64 now = GetCPUTicks();
-			if (m_next_present_deadline == 0 || now + interval < m_next_present_deadline)
-				m_next_present_deadline = now; // first frame, or the clock jumped backwards
-			if (now < m_next_present_deadline)
+			// Accumulator pacer, not a simple "too soon?" test: advancing the deadline by exactly one
+			// interval holds the requested AVERAGE rate even when it isn't a whole division of the
+			// source (47 or 55 fps work, not just 30/20/15). Resynchronise when we fall more than one
+			// interval behind, so a hitch can't bank credit and then burst.
+			const u64 interval = GSGetMaxPresentInterval();
+			if (interval > 0)
 			{
-				skip_frame = true;
-				deliberate_present_skip = true;
+				const u64 now = GetCPUTicks();
+				if (m_next_present_deadline == 0 || now + interval < m_next_present_deadline)
+					m_next_present_deadline = now; // first frame, or the clock jumped backwards
+				if (now < m_next_present_deadline)
+				{
+					skip_frame = true;
+					deliberate_present_skip = true;
+					fps_cap_present_skip = true;
+				}
+				else if ((now - m_next_present_deadline) > interval)
+					m_next_present_deadline = now + interval; // far behind: restart the cadence
+				else
+					m_next_present_deadline += interval;
 			}
-			else if ((now - m_next_present_deadline) > interval)
-				m_next_present_deadline = now + interval; // far behind: restart the cadence
 			else
-				m_next_present_deadline += interval;
+			{
+				m_next_present_deadline = 0;
+			}
 		}
 		else
 		{
+			// Turbo owns presentation cadence while a custom cap is active. Re-prime
+			// from the next normal frame instead of carrying a stale deadline forward.
 			m_next_present_deadline = 0;
 		}
 	}
 
-	const bool blank_frame = !Merge(field);
+	// The GS has already processed draw commands and framebuffer writes before VSync. A cap-skipped
+	// frame can omit display-only work when no image consumer is active.
+	// Interlaced frames take a separate history-only path below so temporal deinterlacing remains
+	// correct. Requiring an actual cap-created skip keeps duplicate/manual skips on master's
+	// original full-render path when the default 60 FPS mode is selected.
+	const bool request_skipped_final_render =
+		fps_cap_present_skip && GSGetPresentCapRenderSkip() &&
+		GSIsHardwareRenderer() &&
+		m_regs->EXTWRITE.WRITE == 0 &&
+		m_snapshot.empty() && !m_dump && m_dump_frames == 0 && !GSCapture::IsCapturingVideo() &&
+		!GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()) && g_gs_device->GetCurrent() != nullptr;
+
+	bool merged_frame;
+	if (!request_skipped_final_render)
+	{
+		// Compile-time specialization leaves the default 60 FPS path with the same
+		// full Merge() work and no per-frame merge-mode checks.
+		merged_frame = Merge<MergeMode::Full>(field);
+	}
+	else if (isReallyInterlaced() && GSConfig.InterlaceMode != GSInterlaceMode::Off)
+	{
+		merged_frame = Merge<MergeMode::InterlaceHistoryOnly>(field);
+	}
+	else
+	{
+		merged_frame = Merge<MergeMode::SkipFinalComposition>(field);
+	}
+	const bool skipped_final_render = request_skipped_final_render && merged_frame;
+	const bool blank_frame = !merged_frame;
+	// Run length, not just "was blank": the policy below distinguishes a single alternating blank
+	// (an interlaced-field artefact, safe to drop) from a run of them (a fade the game is actually
+	// drawing, which must be presented).
+	if (!skipped_final_render)
+		m_consecutive_blank_frames = blank_frame ? (m_consecutive_blank_frames + 1) : 0;
 
 	// ★ @@ANDROID_STALEFRAMES@@ — diagnostic for "the picture freezes but emulation keeps running".
 	// Measured on a Retroid Pocket 6: SurfaceFlinger presents steadily at 120 Hz straight through
@@ -856,24 +961,42 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;
 
-	// ★ Age the texture pool on EVERY frame, including skipped presents. AgePool() is what trims
-	// stale textures and it is the ONLY place GSDevice::m_frame advances, so parking it on the skip
-	// path had two compounding costs:
-	//   - the pool stops being trimmed and grows to its limit, at which point FetchSurface starts
-	//     handing back textures recycled in the current frame instead of fresh ones;
-	//   - m_frame freezes, so every texture recycled during the run looks "used this frame" and the
-	//     fallback above is taken even more often.
-	// Reported as "the game runs slow in some scenes, and changing ANY on-screen-display option
-	// makes it full speed again" — that is not the OSD, it is the settings apply calling
-	// g_gs_device->PurgePool() (GS.cpp:334/:1029) and emptying the bloated pool. With
-	// SkipDuplicateFrames on by default, plus the frame-skip and FPS-cap paths above, skipped
-	// presents are common, so the pool could go a long time without aging. Aging is about texture
-	// lifetime, not presentation, so it belongs on both paths.
+	// Only cap-created skips may defer the maintenance scan. Native 60 FPS,
+	// duplicate-frame skips, and manual skips retain master's AgePool() behavior.
 	if (!idle_frame)
-		g_gs_device->AgePool();
+	{
+		if (fps_cap_present_skip && GSGetPresentCapRenderSkip())
+			g_gs_device->AgePoolAfterPresentCapSkip();
+		else
+			g_gs_device->AgePool();
+	}
+
+#ifdef __ANDROID__
+	// Suppress only startup blanks, before the GS has produced any output. Mid-game blank/fade
+	// frames must take the normal present path: explicit APIs such as Vulkan need that path to
+	// submit the recorded command buffer and finalize texture state for the following frame.
+	// See GSPresentationPolicy.h. Ported from sashkinbro/EmuCoreX.
+	//
+	// ...but never suppress a blank that has an OSD message or a toast on top of it. With Skip BIOS
+	// on there is no boot animation, so the game shows a black screen with no GS output for a while,
+	// and the RetroAchievements "achievements loaded" toast posts into exactly that window. Skipping
+	// the present means EndPresentFrame() — and with it the OSD/notification draw — never runs, so
+	// the toast is queued but invisible until something forces a real present (opening the pause
+	// menu, which is why it appears there and vanishes on back-out). Presenting a blank with content
+	// on it is precisely what the pause menu already does here, and is safe: the swapchain image is
+	// acquired and ImGui draws over black.
+	const bool skip_blank = ShouldSkipAndroidBlankFrame(
+		blank_frame,
+		g_gs_device->GetCurrent() != nullptr,
+		g_gs_device->GetRenderAPI() == RenderAPI::Vulkan,
+		m_consecutive_blank_frames) &&
+		!ImGuiManager::HasPresentableOverlayContent();
+#else
+	constexpr bool skip_blank = false;
+#endif
 
 	// Skip presentation when running uncapped while vsync is on.
-	if (skip_frame || g_gs_device->ShouldSkipPresentingFrame())
+	if (skip_frame || skip_blank || g_gs_device->ShouldSkipPresentingFrame())
 	{
 		if (BeginPresentFrame(true))
 			EndPresentFrame();
@@ -1015,10 +1138,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			if (GSConfig.UserHacks_ReadTCOnClose)
 				ReadbackTextureCache();
 
+			// The dump replays from this state forward, so it has to be the state a
+			// savestate would record here: parse registers from the front object under
+			// the split, local memory from the back. m_parse_target->Freeze() is the
+			// same call GSfreeze makes, and it drains before serializing.
 			freezeData fd = {0, nullptr};
-			Freeze(&fd, true);
+			m_parse_target->Freeze(&fd, true);
 			fd.data = new u8[fd.size];
-			Freeze(&fd, false);
+			m_parse_target->Freeze(&fd, false);
 
 			// keep the screenshot relatively small so we don't bloat the dump
 			static constexpr u32 DUMP_SCREENSHOT_WIDTH = 640;
@@ -1133,10 +1260,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		DumpTransferImages();
 }
 
-void GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
+bool GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 {
 	if (!m_snapshot.empty())
-		return;
+		return false;
 
 	// Allows for providing a complete path
 	if (path.size() > 4 && StringUtil::EndsWithNoCase(path, ".png"))
@@ -1146,6 +1273,7 @@ void GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 
 	// this is really gross, but wx we get the snapshot request after shift...
 	m_dump_frames = gsdump_frames;
+	return true;
 }
 
 static std::string GSGetBaseFilename()
@@ -1298,6 +1426,11 @@ void GSSetPortraitRenderTopInset(int pixels)
 void GSSetPortraitRenderTopAlign(bool enabled)
 {
 	s_portrait_render_top = enabled;
+}
+
+void GSSetLandscapeRenderTopAlign(bool enabled)
+{
+	s_landscape_render_top = enabled;
 }
 
 bool GSRenderer::BeginCapture(std::string filename, const GSVector2i& size)
